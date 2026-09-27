@@ -32,6 +32,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Encodes embed requests and decodes worker outputs.
@@ -66,26 +67,26 @@ final class EmbedCodec {
         if (output.getCode() >= ERROR_CODE) {
             return Result.response(errorResponse(output));
         }
-        float[][] binary = readBinary(output);
+        Optional<float[][]> binary = readBinary(output);
         byte[] json = jsonPayload(output);
-        if (binary != null) {
-            return finishBinary(output, binary, json);
+        if (binary.isPresent()) {
+            return finishBinary(output, binary.get(), json);
         }
         return finishJson(output, json);
     }
 
-    private static float[][] readBinary(Output output) {
+    private static Optional<float[][]> readBinary(Output output) {
         byte[] blob = output.getAsBytes(BINARY_KEY);
         if (blob == null) {
-            return null;
+            return Optional.empty();
         }
         return parseBinary(blob);
     }
 
-    private static float[][] parseBinary(byte[] blob) {
+    private static Optional<float[][]> parseBinary(byte[] blob) {
         if (blob.length < HEADER_BYTES) {
             logger.warn("embedding-f32 payload is truncated, falling back to JSON");
-            return null;
+            return Optional.empty();
         }
         ByteBuffer buffer = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN);
         int version = buffer.getInt();
@@ -93,19 +94,21 @@ final class EmbedCodec {
         int dimension = buffer.getInt();
         if (version != VERSION) {
             logger.warn("embedding-f32 version {} is unsupported, falling back to JSON", version);
-            return null;
+            return Optional.empty();
         }
         if (count < 1 || dimension < 1) {
             logger.warn("embedding-f32 count or dimension is invalid, falling back to JSON");
-            return null;
+            return Optional.empty();
         }
-        long floats = (long) count * (long) dimension;
-        long expected = HEADER_BYTES + floats * (long) Float.BYTES;
+        long vectorCount = count;
+        long vectorDimension = dimension;
+        long floats = vectorCount * vectorDimension;
+        long expected = HEADER_BYTES + floats * Float.BYTES;
         if (expected != blob.length) {
             logger.warn(
                     "embedding-f32 length does not match count and dimension, falling back to"
-                        + " JSON");
-            return null;
+                            + " JSON");
+            return Optional.empty();
         }
         float[][] vectors = new float[count][dimension];
         for (int i = 0; i < count; i++) {
@@ -113,18 +116,20 @@ final class EmbedCodec {
                 vectors[i][j] = buffer.getFloat();
             }
         }
-        return vectors;
+        return Optional.of(vectors);
     }
 
     /** A well-formed blob is the result. JSON is parsed only to detect a formatter mismatch. */
     private static Result finishBinary(Output output, float[][] binary, byte[] json) {
-        if (json == null) {
+        if (json.length == 0) {
             return Result.response(vectorsResponse(output, binary));
         }
         float[][] parsed;
         try {
             parsed = parseJson(json);
         } catch (BadMatrixException e) {
+            logger.warn(
+                    "embedding-f32 is well formed but JSON is not a matrix: {}", e.getMessage());
             return Result.internal("embedding-f32 does not match JSON embeddings");
         }
         if (!sameVectors(binary, parsed)) {
@@ -134,7 +139,7 @@ final class EmbedCodec {
     }
 
     private static Result finishJson(Output output, byte[] json) {
-        if (json == null) {
+        if (json.length == 0) {
             return Result.failedPrecondition("embedding JSON is empty");
         }
         try {
@@ -158,7 +163,7 @@ final class EmbedCodec {
                 return bytes;
             }
         }
-        return null;
+        return new byte[0];
     }
 
     private static float[][] parseJson(byte[] json) {
@@ -166,7 +171,7 @@ final class EmbedCodec {
         try {
             root = JsonParser.parseString(new String(json, StandardCharsets.UTF_8));
         } catch (JsonParseException e) {
-            throw new BadMatrixException("embedding JSON is not a numeric matrix");
+            throw new BadMatrixException("embedding JSON is not a numeric matrix", e);
         }
         if (root == null || !root.isJsonArray()) {
             throw new BadMatrixException("embedding JSON is not a numeric matrix");
@@ -300,6 +305,10 @@ final class EmbedCodec {
 
         private BadMatrixException(String message) {
             super(message);
+        }
+
+        private BadMatrixException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 }
