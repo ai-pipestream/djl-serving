@@ -12,8 +12,8 @@
 # the specific language governing permissions and limitations under the License.
 """JSON-only embedding fixture.
 
-Predict receives a JSON matrix. There is no embedding-f32 payload, so Embed
-must not treat this output as success. No torch and no GPU.
+Predict receives a JSON matrix. There is no EmbedResponse, so Embed must
+not treat this output as success. No torch and no GPU.
 """
 
 import json

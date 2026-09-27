@@ -154,7 +154,7 @@ public class GrpcTest {
                 Assert.assertEquals(
                         jsonOnly.getStatus().getCode(), Status.Code.FAILED_PRECONDITION);
                 Assert.assertEquals(
-                        jsonOnly.getStatus().getDescription(), "embedding-f32 payload is missing");
+                        jsonOnly.getStatus().getDescription(), "EmbedResponse payload is missing");
 
                 Iterator<InferenceResponse> ret = client.inference("invalid", "v1", headers, "");
                 Assert.assertThrows(ret::next);

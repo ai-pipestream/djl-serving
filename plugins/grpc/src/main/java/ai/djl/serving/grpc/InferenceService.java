@@ -183,7 +183,7 @@ class InferenceService extends InferenceGrpc.InferenceImplBase {
         }
 
         Input input = new Input();
-        EmbedCodec.applyRequest(input, request.getInputsList());
+        EmbedCodec.applyRequest(input, request);
         modelManager
                 .runJob(workflow, input)
                 .whenCompleteAsync(

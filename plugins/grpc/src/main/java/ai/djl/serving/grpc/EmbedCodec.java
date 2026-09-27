@@ -14,103 +14,62 @@ package ai.djl.serving.grpc;
 
 import ai.djl.modality.Input;
 import ai.djl.modality.Output;
+import ai.djl.serving.grpc.proto.EmbedRequest;
 import ai.djl.serving.grpc.proto.EmbedResponse;
-import ai.djl.serving.grpc.proto.Embedding;
+
+import com.google.protobuf.InvalidProtocolBufferException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
-import java.util.List;
-
 /**
- * Encodes embed requests and decodes worker outputs.
+ * Passes generated {@link EmbedRequest} and {@link EmbedResponse} bytes across the worker.
  *
- * <p>Texts go to the worker as the {@code embed-texts} content key. Vectors come back only from
- * the {@code embedding-f32} content key. This class does not build or parse JSON.
+ * <p>The content value is {@code toByteArray} on the way in and {@code parseFrom} on the way out.
+ * This class does not define another byte layout.
  */
 final class EmbedCodec {
 
-    static final String BINARY_KEY = "embedding-f32";
-    static final String TEXTS_KEY = "embed-texts";
-    static final String TEXTS_CONTENT_TYPE = "application/x-embedding-texts";
+    static final String CONTENT_TYPE = "application/x-protobuf";
 
     private static final Logger logger = LoggerFactory.getLogger(EmbedCodec.class);
 
-    private static final int VERSION = 1;
-    private static final int HEADER_BYTES = 12;
-    private static final int TEXT_HEADER_BYTES = 8;
     private static final int ERROR_CODE = 300;
 
     private EmbedCodec() {}
 
-    /** Writes the repeated texts as a typed content payload. */
-    static void applyRequest(Input input, List<String> inputs) {
-        input.addProperty("Content-Type", TEXTS_CONTENT_TYPE);
-        input.add(TEXTS_KEY, encodeTexts(inputs));
+    static String requestKey() {
+        return EmbedRequest.getDescriptor().getFullName();
     }
 
-    /**
-     * Little-endian layout: version 1, text count, then each text as a byte length and UTF-8
-     * bytes.
-     */
-    static byte[] encodeTexts(List<String> inputs) {
-        byte[][] encoded = new byte[inputs.size()][];
-        int size = TEXT_HEADER_BYTES;
-        for (int i = 0; i < inputs.size(); i++) {
-            encoded[i] = inputs.get(i).getBytes(StandardCharsets.UTF_8);
-            size += Integer.BYTES + encoded[i].length;
-        }
-        ByteBuffer buffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN);
-        buffer.putInt(VERSION);
-        buffer.putInt(encoded.length);
-        for (byte[] text : encoded) {
-            buffer.putInt(text.length);
-            buffer.put(text);
-        }
-        return buffer.array();
+    static String responseKey() {
+        return EmbedResponse.getDescriptor().getFullName();
+    }
+
+    /** Writes the request message bytes onto the model input. */
+    static void applyRequest(Input input, EmbedRequest request) {
+        input.addProperty("Content-Type", CONTENT_TYPE);
+        input.add(requestKey(), request.toByteArray());
     }
 
     static Result decode(Output output) {
         if (output.getCode() >= ERROR_CODE) {
             return Result.response(errorResponse(output));
         }
-        byte[] blob = output.getAsBytes(BINARY_KEY);
-        if (blob == null) {
-            return failed("embedding-f32 payload is missing");
+        byte[] blob = output.getAsBytes(responseKey());
+        if (blob == null || blob.length == 0) {
+            return failed("EmbedResponse payload is missing");
         }
-        return decodeBlob(output, blob);
-    }
-
-    private static Result decodeBlob(Output output, byte[] blob) {
-        if (blob.length < HEADER_BYTES) {
-            return failed("embedding-f32 payload is truncated");
+        EmbedResponse parsed;
+        try {
+            parsed = EmbedResponse.parseFrom(blob);
+        } catch (InvalidProtocolBufferException e) {
+            return failed("EmbedResponse payload is invalid");
         }
-        ByteBuffer buffer = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN);
-        int version = buffer.getInt();
-        int count = buffer.getInt();
-        int dimension = buffer.getInt();
-        if (version != VERSION) {
-            return failed("embedding-f32 version is unsupported");
+        if (parsed.getCode() < ERROR_CODE && parsed.getEmbeddingsCount() == 0) {
+            return failed("EmbedResponse payload is missing");
         }
-        if (count < 1 || dimension < 1) {
-            return failed("embedding-f32 count or dimension is invalid");
-        }
-        long vectorCount = count;
-        long vectorDimension = dimension;
-        long expected = HEADER_BYTES + vectorCount * vectorDimension * Float.BYTES;
-        if (expected != blob.length) {
-            return failed("embedding-f32 length does not match count and dimension");
-        }
-        float[][] vectors = new float[count][dimension];
-        for (int i = 0; i < count; i++) {
-            for (int j = 0; j < dimension; j++) {
-                vectors[i][j] = buffer.getFloat();
-            }
-        }
-        return Result.response(vectorsResponse(output, vectors));
+        return Result.response(parsed);
     }
 
     private static Result failed(String description) {
@@ -122,21 +81,6 @@ final class EmbedCodec {
         EmbedResponse.Builder builder = EmbedResponse.newBuilder().setCode(output.getCode());
         if (output.getMessage() != null) {
             builder.setMessage(output.getMessage());
-        }
-        return builder.build();
-    }
-
-    private static EmbedResponse vectorsResponse(Output output, float[][] vectors) {
-        EmbedResponse.Builder builder = EmbedResponse.newBuilder().setCode(output.getCode());
-        if (output.getMessage() != null) {
-            builder.setMessage(output.getMessage());
-        }
-        for (int i = 0; i < vectors.length; i++) {
-            Embedding.Builder embedding = Embedding.newBuilder().setIndex(i);
-            for (float value : vectors[i]) {
-                embedding.addVector(value);
-            }
-            builder.addEmbeddings(embedding);
         }
         return builder.build();
     }

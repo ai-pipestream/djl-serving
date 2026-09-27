@@ -226,9 +226,9 @@ When using dynamic batching, errors are returned with HTTP response code 400 and
 
 `Inference.Embed` is a unary RPC on the service that already serves `Ping` and `Predict`. Model configuration, HTTP `POST /predictions/{model}` and `POST /invocations`, and gRPC `Predict` stay JSON. The Embed call does not use JSON on the way in or the way out.
 
-`EmbedRequest.inputs` is one or more strings. The service passes those strings to the model as a typed content payload, content key `embed-texts`, with content type `application/x-embedding-texts`. The bytes are little-endian: version `1`, a text count, then each text as a UTF-8 byte length and the UTF-8 bytes. An empty `inputs` list, or a blank string, is `INVALID_ARGUMENT` and is not sent to the model. A missing model is `NOT_FOUND`.
+`EmbedRequest.inputs` is one or more strings. The service writes that `EmbedRequest` to the worker with `toByteArray`, content type `application/x-protobuf`. The worker parses the same generated message. An empty `inputs` list, or a blank string, is `INVALID_ARGUMENT` and is not sent to the model. A missing model is `NOT_FOUND`.
 
-The worker reply Embed reads is the `embedding-f32` content record only: raw little-endian bytes, version `1`, vector count, dimension, and row-major float32 values. Java reads that record with `ByteBuffer`. It is not a base64 field and it is not a key inside the JSON body. `EmbedResponse.embeddings` carries one `Embedding` per row, with `index` and a packed `float` `vector`. A missing or bad `embedding-f32` payload is `FAILED_PRECONDITION`. A worker that returns only the JSON matrix does not succeed as Embed. HTTP and `Predict` still return that JSON matrix. The vLLM formatter keeps writing it for those clients and does not put the float record in that string.
+The worker reply Embed reads is a generated `EmbedResponse`, parsed with `parseFrom`. `embeddings` carries one `Embedding` per row, with `index` and a packed `float` `vector`. A missing or invalid `EmbedResponse` is `FAILED_PRECONDITION`. A worker that returns only the JSON matrix does not succeed as Embed. HTTP and `Predict` still return that JSON matrix. The vLLM formatter keeps writing it for those clients from the engine's `EmbeddingResponse.data` float vectors.
 
 ```java
 EmbedResponse response = client.embed(modelName, List.of("What is Deep Learning?"));
@@ -236,4 +236,4 @@ Embedding row = response.getEmbeddings(0);
 List<Float> vector = row.getVectorList();
 ```
 
-`Embed` runs on the workers already configured for that model. On GPU, keep the single-worker setting from the deployment section above. Rust, ONNX, and PyTorch models keep returning JSON for HTTP and `Predict`. They succeed on Embed only when they write `embedding-f32`.
+`Embed` runs on the workers already configured for that model. On GPU, keep the single-worker setting from the deployment section above. Rust, ONNX, and PyTorch models keep returning JSON for HTTP and `Predict`. They succeed on Embed only when they write an `EmbedResponse`.

@@ -10,10 +10,7 @@
 # or in the "LICENSE.txt" file accompanying this file. This file is distributed on an "AS IS"
 # BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied. See the License for
 # the specific language governing permissions and limitations under the License.
-import array
 import json
-import struct
-import sys
 from typing import Callable, Optional, Tuple, Union, List, Dict
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
@@ -30,6 +27,7 @@ from vllm.tokenizers import TokenizerLike
 
 from djl_python.outputs import Output
 from djl_python.async_utils import create_non_stream_output, create_stream_chunk_output
+from djl_python.inference_pb2 import EmbedRequest, EmbedResponse
 
 
 class ProcessedRequest:
@@ -307,92 +305,75 @@ def lmi_stream_output_formatter(
     return convert_completion_chunk_response_to_lmi_schema(chunk, **kwargs)
 
 
-def _embedding_matrix_shape(embeddings: List):
-    """Return (count, dimension) when every row is a non-empty vector of one size."""
-    if not isinstance(embeddings, list) or not embeddings:
-        return None
-    dimension = None
-    for row in embeddings:
-        if not isinstance(row, list) or not row:
-            return None
-        if dimension is None:
-            dimension = len(row)
-        elif len(row) != dimension:
-            return None
-    return len(embeddings), dimension
+PROTO_CONTENT_TYPE = "application/x-protobuf"
 
 
-EMBED_TEXTS_KEY = "embed-texts"
-EMBED_TEXTS_CONTENT_TYPE = "application/x-embedding-texts"
+def read_embed_request(inputs) -> Optional[List[str]]:
+    """Return EmbedRequest texts, or None when this request is JSON.
 
-
-def read_embed_texts(inputs) -> Optional[List[str]]:
-    """Return typed Embed texts, or None when this request is JSON.
-
-    Layout is little-endian: version 1, text count, then each text as an
-    int32 byte length and UTF-8 bytes. HTTP and Predict do not use this key.
+    The bytes are the generated EmbedRequest message. HTTP and Predict do not
+    send that message.
     """
     content_type = ""
     if hasattr(inputs, "get_property"):
         content_type = inputs.get_property("Content-Type") or ""
-    has_key = hasattr(inputs, "contains_key") and inputs.contains_key(
-        EMBED_TEXTS_KEY)
-    if content_type != EMBED_TEXTS_CONTENT_TYPE and not has_key:
+    key = EmbedRequest.DESCRIPTOR.full_name
+    has_key = hasattr(inputs, "contains_key") and inputs.contains_key(key)
+    if content_type != PROTO_CONTENT_TYPE and not has_key:
         return None
-    return _decode_embed_texts(inputs.get_as_bytes(key=EMBED_TEXTS_KEY))
-
-
-def _decode_embed_texts(blob: bytes) -> List[str]:
-    if blob is None or len(blob) < 8:
-        raise ValueError("embed-texts payload is truncated")
-    version, count = struct.unpack_from("<ii", blob, 0)
-    if version != 1:
-        raise ValueError("embed-texts version is unsupported")
-    if count < 1:
-        raise ValueError("embed-texts count is invalid")
-    offset = 8
-    texts = []
-    for _ in range(count):
-        if offset + 4 > len(blob):
-            raise ValueError("embed-texts payload is truncated")
-        (length,) = struct.unpack_from("<i", blob, offset)
-        offset += 4
-        if length < 0 or offset + length > len(blob):
-            raise ValueError("embed-texts payload is truncated")
-        texts.append(blob[offset:offset + length].decode("utf-8"))
-        offset += length
-    if offset != len(blob):
-        raise ValueError("embed-texts length does not match count")
-    return texts
-
-
-def _embedding_f32_blob(embeddings: List, count: int, dimension: int) -> bytes:
-    """Little-endian layout: version 1, vector count, dimension, row-major float32."""
-    flat = array.array("f")
-    for row in embeddings:
-        flat.extend(float(value) for value in row)
-    if sys.byteorder != "little":
-        flat.byteswap()
-    return struct.pack("<iii", 1, count, dimension) + flat.tobytes()
-
-
-def create_embedding_non_stream_output(embeddings: List) -> Output:
-    """JSON ``data`` for HTTP and Predict, plus a raw ``embedding-f32`` record.
-
-    The float record is little-endian bytes on its own content key. It is not
-    base64 and it is not a field of the string envelope. The record is omitted
-    when the list is empty or ragged so the HTTP JSON body is unchanged.
-    """
-    data = json.dumps(embeddings)
-    shape = _embedding_matrix_shape(embeddings)
-    if shape is None:
-        return create_non_stream_output(data)
+    if not has_key:
+        raise ValueError("EmbedRequest payload is missing")
+    blob = inputs.get_as_bytes(key=key)
+    if not blob:
+        raise ValueError("EmbedRequest payload is missing")
+    request = EmbedRequest()
     try:
-        blob = _embedding_f32_blob(embeddings, shape[0], shape[1])
-    except (TypeError, ValueError):
-        return create_non_stream_output(data)
-    output = create_non_stream_output(data)
-    output.add(blob, key="embedding-f32")
+        request.ParseFromString(bytes(blob))
+    except Exception as exc:
+        raise ValueError("EmbedRequest payload is invalid") from exc
+    return list(request.inputs)
+
+
+def _embedding_rows(response):
+    """Float rows from EmbeddingResponse.data. Does not read a response body."""
+    data = getattr(response, "data", None)
+    if not isinstance(data, list) or not data:
+        return None
+    rows = []
+    for position, item in enumerate(data):
+        embedding = getattr(item, "embedding", None)
+        if isinstance(embedding, str) or not isinstance(embedding, (list, tuple)):
+            return None
+        if any(isinstance(value, str) for value in embedding):
+            return None
+        try:
+            vector = [float(value) for value in embedding]
+        except (TypeError, ValueError):
+            return None
+        if not vector:
+            return None
+        index = getattr(item, "index", position)
+        if not isinstance(index, int):
+            return None
+        rows.append((index, vector))
+    return rows
+
+
+def create_embedding_non_stream_output(rows) -> Output:
+    """JSON ``data`` for HTTP and Predict, plus EmbedResponse bytes.
+
+    The protobuf record is the generated message. HTTP and Predict read the
+    JSON string. Embed reads the message bytes.
+    """
+    matrix = [vector for _, vector in rows]
+    output = create_non_stream_output(json.dumps(matrix))
+    message = EmbedResponse()
+    message.code = 200
+    for index, vector in rows:
+        embedding = message.embeddings.add()
+        embedding.index = index
+        embedding.vector.extend(vector)
+    output.add(message.SerializeToString(), key=EmbedResponse.DESCRIPTOR.full_name)
     return output
 
 
@@ -400,16 +381,21 @@ def embedding_output_formatter(response,
                                request=None,
                                tokenizer=None,
                                **_) -> Output:
-    body = response.body
-    if isinstance(body, bytes):
-        body = body.decode('utf-8')
-    if hasattr(response, 'status_code') and response.status_code != 200:
-        return create_non_stream_output("",
-                                        error=body,
-                                        code=response.status_code)
-    parsed = json.loads(body)
-    if "data" not in parsed:
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int) and status != 200:
+        body = getattr(response, "body", "") or ""
+        if isinstance(body, bytes):
+            body = body.decode("utf-8")
+        if not isinstance(body, str):
+            body = ""
+        error = getattr(response, "error", None)
+        message = getattr(error, "message", None)
+        if isinstance(message, str) and message:
+            body = message
         return create_non_stream_output(
-            "", error=f"Unexpected embedding response: {body}", code=500)
-    embeddings = [item["embedding"] for item in parsed["data"]]
-    return create_embedding_non_stream_output(embeddings)
+            "", error=body or "embedding request failed", code=status)
+    rows = _embedding_rows(response)
+    if rows is None:
+        return create_non_stream_output(
+            "", error="embedding response has no float vectors", code=500)
+    return create_embedding_non_stream_output(rows)

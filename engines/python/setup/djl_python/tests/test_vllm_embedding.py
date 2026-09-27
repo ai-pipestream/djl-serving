@@ -50,71 +50,46 @@ def _decode_output(output: Output) -> dict:
     return pairs
 
 
+class _EmbeddingItem:
+
+    def __init__(self, embedding, index):
+        self.embedding = embedding
+        self.index = index
+
+
+class _EngineEmbedding:
+
+    def __init__(self, rows, status_code=200):
+        self.data = [
+            _EmbeddingItem(row, index) for index, row in enumerate(rows)
+        ]
+        self.status_code = status_code
+
+
+class _ErrorResponse:
+
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self.body = body
+
+
 class TestEmbeddingOutputFormatter(unittest.TestCase):
 
     def setUp(self):
         from djl_python.lmi_vllm.request_response_utils import embedding_output_formatter
         self.formatter = embedding_output_formatter
 
-    def test_single_embedding_from_json_response(self):
-        openai_response = {
-            "object":
-            "list",
-            "data": [{
-                "object": "embedding",
-                "embedding": [0.1, 0.2, 0.3],
-                "index": 0
-            }],
-            "model":
-            "test-model",
-            "usage": {
-                "prompt_tokens": 5,
-                "total_tokens": 5
-            }
-        }
-        mock_response = MagicMock()
-        mock_response.body = json.dumps(openai_response).encode('utf-8')
-        mock_response.status_code = 200
-
-        output = self.formatter(mock_response)
+    def test_single_embedding_from_engine_response(self):
+        output = self.formatter(_EngineEmbedding([[0.1, 0.2, 0.3]]))
         decoded = _decode_output(output)
         data = json.loads(decoded["data"].strip())
         self.assertEqual(data, [[0.1, 0.2, 0.3]])
         self.assertEqual(decoded["last"], "True")
 
     def test_batch_embeddings_from_json_response(self):
-        openai_response = {
-            "object":
-            "list",
-            "data": [
-                {
-                    "object": "embedding",
-                    "embedding": [0.1, 0.2, 0.3],
-                    "index": 0
-                },
-                {
-                    "object": "embedding",
-                    "embedding": [0.4, 0.5, 0.6],
-                    "index": 1
-                },
-                {
-                    "object": "embedding",
-                    "embedding": [0.7, 0.8, 0.9],
-                    "index": 2
-                },
-            ],
-            "model":
-            "test-model",
-            "usage": {
-                "prompt_tokens": 15,
-                "total_tokens": 15
-            }
-        }
-        mock_response = MagicMock()
-        mock_response.body = json.dumps(openai_response).encode('utf-8')
-        mock_response.status_code = 200
-
-        output = self.formatter(mock_response)
+        output = self.formatter(
+            _EngineEmbedding([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6],
+                              [0.7, 0.8, 0.9]]))
         decoded = _decode_output(output)
         data = json.loads(decoded["data"].strip())
         self.assertEqual(len(data), 3)
@@ -124,12 +99,7 @@ class TestEmbeddingOutputFormatter(unittest.TestCase):
 
     def test_high_dimensional_embedding(self):
         embedding = [float(i) / 1000 for i in range(768)]
-        openai_response = {"data": [{"embedding": embedding, "index": 0}]}
-        mock_response = MagicMock()
-        mock_response.body = json.dumps(openai_response).encode('utf-8')
-        mock_response.status_code = 200
-
-        output = self.formatter(mock_response)
+        output = self.formatter(_EngineEmbedding([embedding]))
         decoded = _decode_output(output)
         data = json.loads(decoded["data"].strip())
         self.assertEqual(len(data[0]), 768)
@@ -137,96 +107,61 @@ class TestEmbeddingOutputFormatter(unittest.TestCase):
         self.assertAlmostEqual(data[0][767], 0.767)
 
     def test_error_response_returns_error_output(self):
-        error_body = '{"error": "Model not found"}'
-        mock_response = MagicMock()
-        mock_response.body = error_body.encode('utf-8')
-        mock_response.status_code = 404
-
-        output = self.formatter(mock_response)
+        output = self.formatter(
+            _ErrorResponse(404, '{"error": "Model not found"}'))
         decoded = _decode_output(output)
         self.assertIn("error", decoded)
         self.assertEqual(decoded["code"], "404")
 
     def test_missing_data_field_returns_error_output(self):
-        mock_response = MagicMock()
-        mock_response.body = json.dumps({
-            "error": "something went wrong"
-        }).encode('utf-8')
-        mock_response.status_code = 200
-
-        output = self.formatter(mock_response)
+        output = self.formatter(_ErrorResponse(200, "not an embedding object"))
         decoded = _decode_output(output)
         self.assertIn("error", decoded)
         self.assertEqual(decoded["code"], "500")
-        self.assertNotIn("embedding_f32", decoded)
-        self.assertIsNone(self._embedding_f32_bytes(output))
+        self.assertIsNone(self._embed_response(output))
 
-    def _embedding_f32_bytes(self, output):
+    def _embed_response(self, output):
+        from djl_python.inference_pb2 import EmbedResponse
+        key = EmbedResponse.DESCRIPTOR.full_name
         for i in range(output.content.size()):
-            if output.content.key_at(i) == "embedding-f32":
-                return bytes(output.content.value_at(i))
+            if output.content.key_at(i) == key:
+                message = EmbedResponse()
+                message.ParseFromString(bytes(output.content.value_at(i)))
+                return message
         return None
 
-    def _assert_embedding_f32(self, blob: bytes, embeddings):
-        self.assertIsNotNone(blob)
-        count = len(embeddings)
-        dimension = len(embeddings[0])
-        version, blob_count, blob_dimension = struct.unpack_from("<iii", blob, 0)
-        self.assertEqual(blob[:4], struct.pack("<i", 1))
-        self.assertEqual(version, 1)
-        self.assertEqual(blob_count, count)
-        self.assertEqual(blob_dimension, dimension)
-        self.assertEqual(len(blob), 12 + 4 * count * dimension)
-        flat = struct.unpack_from("<{}f".format(count * dimension), blob, 12)
-        for index, value in enumerate(flat):
-            row, col = divmod(index, dimension)
-            self.assertAlmostEqual(value, float(embeddings[row][col]), delta=1e-6)
+    def _assert_embed_response(self, message, embeddings):
+        self.assertIsNotNone(message)
+        self.assertEqual(message.code, 200)
+        self.assertEqual(len(message.embeddings), len(embeddings))
+        for item, expected in zip(message.embeddings, embeddings):
+            self.assertEqual(len(item.vector), len(expected))
+            for actual, value in zip(item.vector, expected):
+                self.assertAlmostEqual(actual, float(value), delta=1e-6)
 
-    def test_embedding_f32_matches_json_vectors(self):
+    def test_embed_response_matches_json_vectors(self):
         embeddings = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-        openai_response = {
-            "data": [{
-                "embedding": row,
-                "index": index
-            } for index, row in enumerate(embeddings)]
-        }
-        mock_response = MagicMock()
-        mock_response.body = json.dumps(openai_response).encode("utf-8")
-        mock_response.status_code = 200
-
-        output = self.formatter(mock_response)
+        output = self.formatter(_EngineEmbedding(embeddings))
         decoded = _decode_output(output)
         self.assertEqual(json.loads(decoded["data"].strip()), embeddings)
         self.assertEqual(decoded["data"], json.dumps(embeddings) + "\n")
         self.assertEqual(decoded["last"], "True")
-        self.assertNotIn("embedding_f32", decoded)
         self.assertEqual(output.properties.get("Content-Type"), "application/json")
-        self._assert_embedding_f32(self._embedding_f32_bytes(output), embeddings)
+        self._assert_embed_response(self._embed_response(output), embeddings)
 
-    def test_high_dimensional_embedding_f32_matches_json(self):
+    def test_high_dimensional_embed_response_matches_json(self):
         embedding = [float(i) / 1000 for i in range(768)]
-        openai_response = {"data": [{"embedding": embedding, "index": 0}]}
-        mock_response = MagicMock()
-        mock_response.body = json.dumps(openai_response).encode("utf-8")
-        mock_response.status_code = 200
-
-        output = self.formatter(mock_response)
+        output = self.formatter(_EngineEmbedding([embedding]))
         decoded = _decode_output(output)
         data = json.loads(decoded["data"].strip())
         self.assertEqual(data, [embedding])
-        self.assertNotIn("embedding_f32", decoded)
-        self._assert_embedding_f32(self._embedding_f32_bytes(output), [embedding])
+        self._assert_embed_response(self._embed_response(output), [embedding])
 
-    def test_error_response_omits_embedding_f32(self):
-        mock_response = MagicMock()
-        mock_response.body = b'{"error": "Model not found"}'
-        mock_response.status_code = 404
-
-        output = self.formatter(mock_response)
+    def test_error_response_omits_embed_response(self):
+        output = self.formatter(_ErrorResponse(404, '{"error": "Model not found"}'))
         decoded = _decode_output(output)
         self.assertEqual(decoded["code"], "404")
-        self.assertNotIn("embedding_f32", decoded)
-        self.assertIsNone(self._embedding_f32_bytes(output))
+        self.assertIsNone(self._embed_response(output))
 
 
 class TestTaskToRunnerConvertMapping(unittest.TestCase):
@@ -515,16 +450,16 @@ class TestPreprocessRequestEmbedding(unittest.TestCase):
         handler.session_manager = None
         mock_extract_lora.return_value = None
 
+        from djl_python.inference_pb2 import EmbedRequest
         texts = ["alpha", "bêta"]
-        parts = [struct.pack("<ii", 1, len(texts))]
-        for text in texts:
-            raw = text.encode("utf-8")
-            parts.append(struct.pack("<i", len(raw)))
-            parts.append(raw)
+        request = EmbedRequest()
+        request.inputs.extend(texts)
         inp = Input()
-        inp.properties["Content-Type"] = "application/x-embedding-texts"
+        inp.properties["Content-Type"] = "application/x-protobuf"
         inp.content = PairList()
-        inp.content.add(key="embed-texts", value=bytearray(b"".join(parts)))
+        inp.content.add(
+            key=EmbedRequest.DESCRIPTOR.full_name,
+            value=bytearray(request.SerializeToString()))
 
         result = handler.preprocess_request(inp)
 
@@ -550,17 +485,8 @@ class TestEmbeddingInference(unittest.TestCase):
         handler.session_manager = None
         handler.tokenizer = MagicMock()
 
-        openai_body = json.dumps({
-            "data": [{
-                "embedding": [0.1, 0.2, 0.3],
-                "index": 0
-            }]
-        }).encode('utf-8')
-        mock_json_response = MagicMock()
-        mock_json_response.body = openai_body
-        mock_json_response.status_code = 200
-
-        embedding_service = AsyncMock(return_value=mock_json_response)
+        embedding_service = AsyncMock(
+            return_value=_EngineEmbedding([[0.1, 0.2, 0.3]]))
         handler.embedding_service = embedding_service
 
         handler.check_health = AsyncMock()
@@ -597,42 +523,16 @@ class TestEmbeddingOutputContract(unittest.TestCase):
             self.assertEqual(actual, expected)
 
     def test_single_input_returns_list_of_one_embedding(self):
-        response = MagicMock()
-        response.body = json.dumps({
-            "data": [{
-                "embedding": [1.0, 2.0, 3.0],
-                "index": 0
-            }]
-        }).encode('utf-8')
-        response.status_code = 200
-
-        output = self.formatter(response)
+        output = self.formatter(_EngineEmbedding([[1.0, 2.0, 3.0]]))
         self._assert_djl_contract(output, [[1.0, 2.0, 3.0]])
 
     def test_batch_returns_list_matching_batch_size(self):
         embeddings = [[float(i)] * 4 for i in range(8)]
-        openai_data = [{
-            "embedding": emb,
-            "index": i
-        } for i, emb in enumerate(embeddings)]
-        response = MagicMock()
-        response.body = json.dumps({"data": openai_data}).encode('utf-8')
-        response.status_code = 200
-
-        output = self.formatter(response)
+        output = self.formatter(_EngineEmbedding(embeddings))
         self._assert_djl_contract(output, embeddings)
 
     def test_output_is_json_content_type(self):
-        response = MagicMock()
-        response.body = json.dumps({
-            "data": [{
-                "embedding": [1.0],
-                "index": 0
-            }]
-        }).encode('utf-8')
-        response.status_code = 200
-
-        output = self.formatter(response)
+        output = self.formatter(_EngineEmbedding([[1.0]]))
         self.assertEqual(output.properties.get("Content-Type"),
                          "application/json")
 

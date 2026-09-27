@@ -38,7 +38,7 @@ message PingResponse {
 message EmbedRequest {
     string model_name = 1;
     optional string model_version = 2;
-    // One string, or several. The service passes these texts to the model as embed-texts, not JSON.
+    // Texts for this model. The worker receives this message's serialized bytes.
     repeated string inputs = 3;
 }
 

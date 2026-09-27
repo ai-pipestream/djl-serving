@@ -52,7 +52,7 @@ from djl_python.lmi_vllm.request_response_utils import (
     lmi_with_details_non_stream_output_formatter,
     lmi_non_stream_output_formatter,
     embedding_output_formatter,
-    read_embed_texts,
+    read_embed_request,
 )
 from djl_python.session_manager import SessionManager
 from djl_python.session_utils import (create_session, close_session,
@@ -63,6 +63,49 @@ from djl_python.adapter_formatter_mixin import AdapterFormatterMixin
 logger = logging.getLogger(__name__)
 
 SESSION_REQUESTS = {"NEW_SESSION": create_session, "CLOSE": close_session}
+
+
+class TypedServingEmbedding(ServingEmbedding):
+    """Build EmbeddingResponse from pooling tensors.
+
+    ``PoolingRequestOutput.outputs.data`` is the engine tensor. Callers read
+    ``response.data[i].embedding`` as a list of floats. This does not serialize
+    the vectors to JSON and parse them back.
+    """
+
+    def _openai_json_response(
+        self,
+        final_res_batch,
+        request_id,
+        created_time,
+        model_name,
+        encoding_format,
+        embed_dtype,
+        endianness,
+    ):
+        from vllm.entrypoints.pooling.embed.protocol import (
+            EmbeddingResponse,
+            EmbeddingResponseData,
+        )
+        from vllm.entrypoints.pooling.utils import (
+            encode_pooling_output_float,
+            get_pooling_usage,
+        )
+
+        items = []
+        for index, final_res in enumerate(final_res_batch):
+            values = encode_pooling_output_float(final_res)
+            if (not isinstance(values, list) or not values
+                    or isinstance(values[0], list)):
+                raise ValueError("embedding output is not a float vector")
+            items.append(EmbeddingResponseData(index=index, embedding=values))
+        return EmbeddingResponse(
+            id=request_id,
+            created=created_time,
+            model=model_name,
+            data=items,
+            usage=get_pooling_usage(final_res_batch),
+        )
 
 
 class VLLMHandler(AdapterFormatterMixin):
@@ -155,7 +198,7 @@ class VLLMHandler(AdapterFormatterMixin):
                                                           "feature-extraction")
 
         if self.is_embedding:
-            self.embedding_service = ServingEmbedding(
+            self.embedding_service = TypedServingEmbedding(
                 self.vllm_engine,
                 self.model_registry,
                 request_logger=None,
@@ -220,11 +263,11 @@ class VLLMHandler(AdapterFormatterMixin):
         assert len(batch) == 1, "only one request per batch allowed"
         raw_request = batch[0]
         session = get_session(self.session_manager, raw_request)
-        typed_texts = read_embed_texts(raw_request)
+        typed_texts = read_embed_request(raw_request)
         if typed_texts is not None:
             if not self.is_embedding:
                 raise ValueError(
-                    "embed-texts is only valid for an embedding model")
+                    "EmbedRequest is only valid for an embedding model")
             decoded_payload = {"inputs": typed_texts}
         else:
             content_type = raw_request.get_property("Content-Type")
