@@ -10,6 +10,7 @@
 # or in the "LICENSE.txt" file accompanying this file. This file is distributed on an "AS IS"
 # BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied. See the License for
 # the specific language governing permissions and limitations under the License.
+import base64
 import json
 import struct
 import unittest
@@ -158,6 +159,65 @@ class TestEmbeddingOutputFormatter(unittest.TestCase):
         decoded = _decode_output(output)
         self.assertIn("error", decoded)
         self.assertEqual(decoded["code"], "500")
+        self.assertNotIn("embedding_f32", decoded)
+
+    def _assert_embedding_f32(self, encoded: str, embeddings):
+        blob = base64.b64decode(encoded)
+        count = len(embeddings)
+        dimension = len(embeddings[0])
+        version, blob_count, blob_dimension = struct.unpack_from("<iii", blob, 0)
+        self.assertEqual(blob[:4], struct.pack("<i", 1))
+        self.assertEqual(version, 1)
+        self.assertEqual(blob_count, count)
+        self.assertEqual(blob_dimension, dimension)
+        self.assertEqual(len(blob), 12 + 4 * count * dimension)
+        flat = struct.unpack_from("<{}f".format(count * dimension), blob, 12)
+        for index, value in enumerate(flat):
+            row, col = divmod(index, dimension)
+            self.assertAlmostEqual(value, float(embeddings[row][col]), delta=1e-6)
+
+    def test_embedding_f32_matches_json_vectors(self):
+        embeddings = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        openai_response = {
+            "data": [{
+                "embedding": row,
+                "index": index
+            } for index, row in enumerate(embeddings)]
+        }
+        mock_response = MagicMock()
+        mock_response.body = json.dumps(openai_response).encode("utf-8")
+        mock_response.status_code = 200
+
+        output = self.formatter(mock_response)
+        decoded = _decode_output(output)
+        self.assertEqual(json.loads(decoded["data"].strip()), embeddings)
+        self.assertEqual(decoded["data"], json.dumps(embeddings) + "\n")
+        self.assertEqual(decoded["last"], "True")
+        self.assertEqual(output.properties.get("Content-Type"), "application/json")
+        self._assert_embedding_f32(decoded["embedding_f32"], embeddings)
+
+    def test_high_dimensional_embedding_f32_matches_json(self):
+        embedding = [float(i) / 1000 for i in range(768)]
+        openai_response = {"data": [{"embedding": embedding, "index": 0}]}
+        mock_response = MagicMock()
+        mock_response.body = json.dumps(openai_response).encode("utf-8")
+        mock_response.status_code = 200
+
+        output = self.formatter(mock_response)
+        decoded = _decode_output(output)
+        data = json.loads(decoded["data"].strip())
+        self.assertEqual(data, [embedding])
+        self._assert_embedding_f32(decoded["embedding_f32"], [embedding])
+
+    def test_error_response_omits_embedding_f32(self):
+        mock_response = MagicMock()
+        mock_response.body = b'{"error": "Model not found"}'
+        mock_response.status_code = 404
+
+        output = self.formatter(mock_response)
+        decoded = _decode_output(output)
+        self.assertEqual(decoded["code"], "404")
+        self.assertNotIn("embedding_f32", decoded)
 
 
 class TestTaskToRunnerConvertMapping(unittest.TestCase):

@@ -10,7 +10,11 @@
 # or in the "LICENSE.txt" file accompanying this file. This file is distributed on an "AS IS"
 # BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied. See the License for
 # the specific language governing permissions and limitations under the License.
+import array
+import base64
 import json
+import struct
+import sys
 from typing import Callable, Tuple, Union, List, Dict
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
@@ -304,6 +308,56 @@ def lmi_stream_output_formatter(
     return convert_completion_chunk_response_to_lmi_schema(chunk, **kwargs)
 
 
+def _embedding_matrix_shape(embeddings: List):
+    """Return (count, dimension) when every row is a non-empty vector of one size."""
+    if not isinstance(embeddings, list) or not embeddings:
+        return None
+    dimension = None
+    for row in embeddings:
+        if not isinstance(row, list) or not row:
+            return None
+        if dimension is None:
+            dimension = len(row)
+        elif len(row) != dimension:
+            return None
+    return len(embeddings), dimension
+
+
+def _embedding_f32_blob(embeddings: List, count: int, dimension: int) -> bytes:
+    """Little-endian layout: version 1, vector count, dimension, row-major float32."""
+    flat = array.array("f")
+    for row in embeddings:
+        flat.extend(float(value) for value in row)
+    if sys.byteorder != "little":
+        flat.byteswap()
+    return struct.pack("<iii", 1, count, dimension) + flat.tobytes()
+
+
+def create_embedding_non_stream_output(embeddings: List) -> Output:
+    """Same JSON envelope as create_non_stream_output, plus embedding_f32.
+
+    ``data`` stays ``json.dumps`` of the vector list. The side channel is
+    omitted when the list is empty or ragged so HTTP JSON is unchanged.
+    """
+    data = json.dumps(embeddings)
+    shape = _embedding_matrix_shape(embeddings)
+    if shape is None:
+        return create_non_stream_output(data)
+    try:
+        blob = _embedding_f32_blob(embeddings, shape[0], shape[1])
+    except (TypeError, ValueError):
+        return create_non_stream_output(data)
+    response_dict = {
+        "data": data + "\n",
+        "last": True,
+    }
+    response_dict["embedding_f32"] = base64.b64encode(blob).decode("ascii")
+    output = Output()
+    output.add_property("Content-Type", "application/json")
+    output.add(Output.binary_encode(response_dict))
+    return output
+
+
 def embedding_output_formatter(response,
                                request=None,
                                tokenizer=None,
@@ -320,4 +374,4 @@ def embedding_output_formatter(response,
         return create_non_stream_output(
             "", error=f"Unexpected embedding response: {body}", code=500)
     embeddings = [item["embedding"] for item in parsed["data"]]
-    return create_non_stream_output(json.dumps(embeddings))
+    return create_embedding_non_stream_output(embeddings)
