@@ -27,6 +27,7 @@ from vllm.tokenizers import TokenizerLike
 
 from djl_python.outputs import Output
 from djl_python.async_utils import create_non_stream_output, create_stream_chunk_output
+from djl_python.embed_response import embed_response_bytes, float32_tensor_bytes
 from djl_python.inference_pb2 import EmbedRequest, EmbedResponse
 
 
@@ -334,53 +335,35 @@ def read_embed_request(inputs) -> Optional[List[str]]:
     return list(request.inputs)
 
 
-def _embedding_rows(response):
-    """Float rows from EmbeddingResponse.data. Does not read a response body."""
-    data = getattr(response, "data", None)
-    if not isinstance(data, list) or not data:
-        return None
-    rows = []
-    for position, item in enumerate(data):
-        embedding = getattr(item, "embedding", None)
-        if isinstance(embedding, str) or not isinstance(embedding, (list, tuple)):
-            return None
-        if any(isinstance(value, str) for value in embedding):
-            return None
-        try:
-            vector = [float(value) for value in embedding]
-        except (TypeError, ValueError):
-            return None
-        if not vector:
-            return None
-        index = getattr(item, "index", position)
-        if not isinstance(index, int):
-            return None
-        rows.append((index, vector))
-    return rows
-
-
-def create_embedding_non_stream_output(rows) -> Output:
-    """JSON ``data`` for HTTP and Predict, plus EmbedResponse bytes.
-
-    The protobuf record is the generated message. HTTP and Predict read the
-    JSON string. Embed reads the message bytes.
-    """
-    matrix = [vector for _, vector in rows]
-    output = create_non_stream_output(json.dumps(matrix))
-    message = EmbedResponse()
-    message.code = 200
-    for index, vector in rows:
-        embedding = message.embeddings.add()
-        embedding.index = index
-        embedding.vector.extend(vector)
-    output.add(message.SerializeToString(), key=EmbedResponse.DESCRIPTOR.full_name)
-    return output
-
-
 def embedding_output_formatter(response,
                                request=None,
                                tokenizer=None,
                                **_) -> Output:
+    """JSON matrix for HTTP and Predict. Embed does not use this formatter."""
+    body = response.body
+    if isinstance(body, bytes):
+        body = body.decode('utf-8')
+    if hasattr(response, 'status_code') and response.status_code != 200:
+        return create_non_stream_output("",
+                                        error=body,
+                                        code=response.status_code)
+    parsed = json.loads(body)
+    if "data" not in parsed:
+        return create_non_stream_output(
+            "", error=f"Unexpected embedding response: {body}", code=500)
+    embeddings = [item["embedding"] for item in parsed["data"]]
+    return create_non_stream_output(json.dumps(embeddings))
+
+
+def embed_output_formatter(response,
+                           request=None,
+                           tokenizer=None,
+                           **_) -> Output:
+    """Copy each engine float32 buffer into EmbedResponse.
+
+    The async envelope's ``data`` string is empty. This does not dump or parse
+    the vectors as JSON.
+    """
     status = getattr(response, "status_code", None)
     if isinstance(status, int) and status != 200:
         body = getattr(response, "body", "") or ""
@@ -394,8 +377,16 @@ def embedding_output_formatter(response,
             body = message
         return create_non_stream_output(
             "", error=body or "embedding request failed", code=status)
-    rows = _embedding_rows(response)
-    if rows is None:
+    tensors = getattr(response, "tensors", None)
+    if not isinstance(tensors, list) or not tensors:
         return create_non_stream_output(
             "", error="embedding response has no float vectors", code=500)
-    return create_embedding_non_stream_output(rows)
+    try:
+        rows = [(index, float32_tensor_bytes(tensor))
+                for index, tensor in enumerate(tensors)]
+    except ValueError as exc:
+        return create_non_stream_output("", error=str(exc), code=500)
+    output = create_non_stream_output("")
+    output.add(embed_response_bytes(200, rows),
+               key=EmbedResponse.DESCRIPTOR.full_name)
+    return output

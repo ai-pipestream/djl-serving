@@ -52,6 +52,7 @@ from djl_python.lmi_vllm.request_response_utils import (
     lmi_with_details_non_stream_output_formatter,
     lmi_non_stream_output_formatter,
     embedding_output_formatter,
+    embed_output_formatter,
     read_embed_request,
 )
 from djl_python.session_manager import SessionManager
@@ -65,12 +66,18 @@ logger = logging.getLogger(__name__)
 SESSION_REQUESTS = {"NEW_SESSION": create_session, "CLOSE": close_session}
 
 
-class TypedServingEmbedding(ServingEmbedding):
-    """Build EmbeddingResponse from pooling tensors.
+class EmbeddingTensors:
+    """Pooling tensors for one Embed call. ``tensors`` are the engine outputs."""
 
-    ``PoolingRequestOutput.outputs.data`` is the engine tensor. Callers read
-    ``response.data[i].embedding`` as a list of floats. This does not serialize
-    the vectors to JSON and parse them back.
+    def __init__(self, tensors):
+        self.tensors = tensors
+
+
+class TensorServingEmbedding(ServingEmbedding):
+    """Hand the engine tensors to the Embed formatter.
+
+    HTTP embedding keeps ``ServingEmbedding``, which JSON-encodes the output.
+    This path does not call ``encode_pooling_output_float``.
     """
 
     def _openai_json_response(
@@ -83,29 +90,8 @@ class TypedServingEmbedding(ServingEmbedding):
         embed_dtype,
         endianness,
     ):
-        from vllm.entrypoints.pooling.embed.protocol import (
-            EmbeddingResponse,
-            EmbeddingResponseData,
-        )
-        from vllm.entrypoints.pooling.utils import (
-            encode_pooling_output_float,
-            get_pooling_usage,
-        )
-
-        items = []
-        for index, final_res in enumerate(final_res_batch):
-            values = encode_pooling_output_float(final_res)
-            if (not isinstance(values, list) or not values
-                    or isinstance(values[0], list)):
-                raise ValueError("embedding output is not a float vector")
-            items.append(EmbeddingResponseData(index=index, embedding=values))
-        return EmbeddingResponse(
-            id=request_id,
-            created=created_time,
-            model=model_name,
-            data=items,
-            usage=get_pooling_usage(final_res_batch),
-        )
+        return EmbeddingTensors(
+            [final_res.outputs.data for final_res in final_res_batch])
 
 
 class VLLMHandler(AdapterFormatterMixin):
@@ -127,6 +113,7 @@ class VLLMHandler(AdapterFormatterMixin):
         self.lora_requests = {}
         self.is_embedding = False
         self.embedding_service = None
+        self.embed_service = None
         self.normalize_embeddings = True
 
     async def initialize(self, properties: dict):
@@ -198,7 +185,13 @@ class VLLMHandler(AdapterFormatterMixin):
                                                           "feature-extraction")
 
         if self.is_embedding:
-            self.embedding_service = TypedServingEmbedding(
+            self.embedding_service = ServingEmbedding(
+                self.vllm_engine,
+                self.model_registry,
+                request_logger=None,
+                chat_template_config=ChatTemplateConfig(),
+            )
+            self.embed_service = TensorServingEmbedding(
                 self.vllm_engine,
                 self.model_registry,
                 request_logger=None,
@@ -317,10 +310,16 @@ class VLLMHandler(AdapterFormatterMixin):
                 # vLLM's use_activation controls L2 normalization in the pooler (vllm 0.19.x)
                 use_activation=self.normalize_embeddings,
             )
+            if typed_texts is not None:
+                invoker = self.embed_service
+                formatter = embed_output_formatter
+            else:
+                invoker = self.embedding_service
+                formatter = embedding_output_formatter
             processed_request = ProcessedRequest(
                 embedding_request,
-                self.embedding_service,
-                embedding_output_formatter,
+                invoker,
+                formatter,
                 None,
                 False,
                 False,

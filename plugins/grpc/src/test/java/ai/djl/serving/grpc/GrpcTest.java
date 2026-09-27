@@ -113,8 +113,11 @@ public class GrpcTest {
                 Embedding row = embed.getEmbeddings(0);
                 Assert.assertEquals(row.getIndex(), 0);
                 Assert.assertEquals(row.getVectorCount(), 2);
-                Assert.assertEquals(row.getVector(0), 0.25f, 1.0e-6f);
-                Assert.assertEquals(row.getVector(1), 0.5f, 1.0e-6f);
+                // Little-endian float32 buffer for 0.25, 0.5. Same bytes the fixture copies.
+                byte[] float32Buffer = {
+                    0x00, 0x00, (byte) 0x80, 0x3e, 0x00, 0x00, 0x00, 0x3f
+                };
+                Assert.assertTrue(contains(row.toByteArray(), float32Buffer));
 
                 it =
                         client.inference(
@@ -162,5 +165,24 @@ public class GrpcTest {
         } finally {
             server.stop();
         }
+    }
+
+    private static boolean contains(byte[] haystack, byte[] needle) {
+        if (needle.length == 0 || haystack.length < needle.length) {
+            return false;
+        }
+        for (int i = 0; i <= haystack.length - needle.length; i++) {
+            boolean match = true;
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return true;
+            }
+        }
+        return false;
     }
 }
