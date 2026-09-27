@@ -432,6 +432,40 @@ class TestPreprocessRequestEmbedding(unittest.TestCase):
         with self.assertRaises(ValueError):
             handler.preprocess_request(inp)
 
+    @patch('djl_python.lmi_vllm.vllm_async_service.decode')
+    @patch('djl_python.lmi_vllm.vllm_async_service._extract_lora_adapter')
+    def test_typed_embed_texts_skip_json_decode(self, mock_extract_lora,
+                                                mock_decode):
+        from djl_python.lmi_vllm.vllm_async_service import VLLMHandler
+        handler = VLLMHandler()
+        handler.is_embedding = True
+        handler.normalize_embeddings = True
+        handler.model_name = "test-embed-model"
+        handler.embedding_service = MagicMock()
+        handler.embed_service = MagicMock()
+        handler.output_formatter = None
+        handler.session_manager = None
+        mock_extract_lora.return_value = None
+
+        from djl_python.inference_pb2 import EmbedRequest
+        from djl_python.lmi_vllm.request_response_utils import embed_output_formatter
+        texts = ["alpha", "bêta"]
+        request = EmbedRequest()
+        request.inputs.extend(texts)
+        inp = Input()
+        inp.properties["Content-Type"] = "application/x-protobuf"
+        inp.content = PairList()
+        inp.content.add(
+            key=EmbedRequest.DESCRIPTOR.full_name,
+            value=bytearray(request.SerializeToString()))
+
+        result = handler.preprocess_request(inp)
+
+        mock_decode.assert_not_called()
+        self.assertEqual(result.vllm_request.input, texts)
+        self.assertIs(result.inference_invoker, handler.embed_service)
+        self.assertIs(result.non_stream_output_formatter, embed_output_formatter)
+
 
 class TestEmbeddingInference(unittest.TestCase):
 
@@ -536,6 +570,73 @@ class TestEmbeddingOutputContract(unittest.TestCase):
         output = self.formatter(response)
         self.assertEqual(output.properties.get("Content-Type"),
                          "application/json")
+
+
+class TestPackedFloat32(unittest.TestCase):
+
+    def test_packed_bytes_match_tensor_buffer(self):
+        import torch
+
+        from djl_python.embed_response import (
+            embed_response_bytes,
+            float32_tensor_bytes,
+        )
+        from djl_python.inference_pb2 import EmbedResponse
+        from djl_python.lmi_vllm.request_response_utils import embed_output_formatter
+        from djl_python.lmi_vllm.vllm_async_service import EmbeddingTensors
+
+        # Signaling NaN (0x7f800001) plus 0.25. A Python float round-trip
+        # changes the NaN payload to 0x7fc00001.
+        raw = bytes.fromhex("0100807f0000803e")
+        tensor = torch.frombuffer(bytearray(raw), dtype=torch.float32).clone()
+        self.assertEqual(float32_tensor_bytes(tensor), raw)
+
+        base = torch.tensor([0.25, 0.5, 0.75, 1.0], dtype=torch.float32)
+        stepped = base[::2]
+        self.assertFalse(stepped.is_contiguous())
+        self.assertEqual(
+            float32_tensor_bytes(stepped),
+            stepped.contiguous().numpy().tobytes())
+
+        wide = torch.tensor([0.25], dtype=torch.float64)
+        with self.assertRaises(ValueError):
+            float32_tensor_bytes(wide)
+
+        blob = embed_response_bytes(200, [(1, raw)])
+        self.assertIn(raw, blob)
+        parsed = EmbedResponse()
+        parsed.ParseFromString(blob)
+        self.assertEqual(parsed.code, 200)
+        self.assertEqual(parsed.embeddings[0].index, 1)
+        self.assertIn(raw, parsed.embeddings[0].SerializeToString())
+
+        output = embed_output_formatter(EmbeddingTensors([tensor, stepped]))
+        message = EmbedResponse()
+        key = EmbedResponse.DESCRIPTOR.full_name
+        found = None
+        for i in range(output.content.size()):
+            if output.content.key_at(i) == key:
+                found = bytes(output.content.value_at(i))
+        self.assertIsNotNone(found)
+        message.ParseFromString(found)
+        self.assertIn(raw, message.embeddings[0].SerializeToString())
+        self.assertIn(
+            stepped.contiguous().numpy().tobytes(),
+            message.embeddings[1].SerializeToString())
+        decoded = _decode_output(output)
+        self.assertEqual(decoded["data"], "\n")
+
+        rejected = embed_output_formatter(EmbeddingTensors([wide]))
+        self.assertIsNone(self._response_bytes(rejected))
+        self.assertEqual(_decode_output(rejected)["code"], "500")
+
+    def _response_bytes(self, output):
+        from djl_python.inference_pb2 import EmbedResponse
+        key = EmbedResponse.DESCRIPTOR.full_name
+        for i in range(output.content.size()):
+            if output.content.key_at(i) == key:
+                return bytes(output.content.value_at(i))
+        return None
 
 
 if __name__ == '__main__':

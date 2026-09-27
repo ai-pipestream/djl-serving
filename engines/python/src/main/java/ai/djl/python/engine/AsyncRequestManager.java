@@ -34,6 +34,8 @@ class AsyncRequestManager {
     private static final Logger logger = LoggerFactory.getLogger(AsyncRequestManager.class);
     private static final Logger MODEL_METRIC = LoggerFactory.getLogger("model_metric");
     private static final String REQUEST_TRACKING_ID = "request_tracking_id";
+    /** Generated full name of EmbedResponse. The value is that message's bytes. */
+    private static final String EMBED_RESPONSE = "ai.djl.serving.grpc.proto.EmbedResponse";
 
     private Dimension dimension;
     private Metrics metrics;
@@ -135,6 +137,11 @@ class AsyncRequestManager {
         if (request == null) {
             logger.warn("Received response for unknown request tracking ID: {}", requestTrackingId);
             return;
+        }
+        // EmbedResponse bytes. Copy them before the envelope's last chunk unblocks readers.
+        byte[] embedResponse = output.getAsBytes(EMBED_RESPONSE);
+        if (embedResponse != null && request.output.getAsBytes(EMBED_RESPONSE) == null) {
+            request.output.add(EMBED_RESPONSE, embedResponse);
         }
         request.addResponse(responseContent, prop);
         if (request.last) {

@@ -221,3 +221,19 @@ When using dynamic batching, errors are returned with HTTP response code 400 and
   "message": "Missing \"inputs\" in json."
 }
 ```
+
+## gRPC Embed
+
+`Inference.Embed` is a unary RPC on the service that already serves `Ping` and `Predict`. Model configuration, HTTP `POST /predictions/{model}` and `POST /invocations`, and gRPC `Predict` stay JSON. The Embed call does not use JSON on the way in or the way out.
+
+`EmbedRequest.inputs` is one or more strings. The service writes that `EmbedRequest` to the worker with `toByteArray`, content type `application/x-protobuf`. The worker parses the same generated message. An empty `inputs` list, or a blank string, is `INVALID_ARGUMENT` and is not sent to the model. A missing model is `NOT_FOUND`.
+
+The worker reply Embed reads is a generated `EmbedResponse`, parsed with `parseFrom`. `embeddings` carries one `Embedding` per row, with `index` and a packed `float` `vector`. Those packed bytes are the engine tensor's float32 buffer, copied into the field. A missing or invalid `EmbedResponse` is `FAILED_PRECONDITION`. A worker that returns only the JSON matrix does not succeed as Embed. HTTP and `Predict` still return that JSON matrix. The vLLM HTTP formatter keeps writing it for those clients. The Embed formatter does not.
+
+```java
+EmbedResponse response = client.embed(modelName, List.of("What is Deep Learning?"));
+Embedding row = response.getEmbeddings(0);
+List<Float> vector = row.getVectorList();
+```
+
+`Embed` runs on the workers already configured for that model. On GPU, keep the single-worker setting from the deployment section above. Rust, ONNX, and PyTorch models keep returning JSON for HTTP and `Predict`. They succeed on Embed only when they write an `EmbedResponse`.

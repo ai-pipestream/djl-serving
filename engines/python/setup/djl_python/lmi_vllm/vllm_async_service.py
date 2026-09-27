@@ -52,6 +52,8 @@ from djl_python.lmi_vllm.request_response_utils import (
     lmi_with_details_non_stream_output_formatter,
     lmi_non_stream_output_formatter,
     embedding_output_formatter,
+    embed_output_formatter,
+    read_embed_request,
 )
 from djl_python.session_manager import SessionManager
 from djl_python.session_utils import (create_session, close_session,
@@ -62,6 +64,34 @@ from djl_python.adapter_formatter_mixin import AdapterFormatterMixin
 logger = logging.getLogger(__name__)
 
 SESSION_REQUESTS = {"NEW_SESSION": create_session, "CLOSE": close_session}
+
+
+class EmbeddingTensors:
+    """Pooling tensors for one Embed call. ``tensors`` are the engine outputs."""
+
+    def __init__(self, tensors):
+        self.tensors = tensors
+
+
+class TensorServingEmbedding(ServingEmbedding):
+    """Hand the engine tensors to the Embed formatter.
+
+    HTTP embedding keeps ``ServingEmbedding``, which JSON-encodes the output.
+    This path does not call ``encode_pooling_output_float``.
+    """
+
+    def _openai_json_response(
+        self,
+        final_res_batch,
+        request_id,
+        created_time,
+        model_name,
+        encoding_format,
+        embed_dtype,
+        endianness,
+    ):
+        return EmbeddingTensors(
+            [final_res.outputs.data for final_res in final_res_batch])
 
 
 class VLLMHandler(AdapterFormatterMixin):
@@ -83,6 +113,7 @@ class VLLMHandler(AdapterFormatterMixin):
         self.lora_requests = {}
         self.is_embedding = False
         self.embedding_service = None
+        self.embed_service = None
         self.normalize_embeddings = True
 
     async def initialize(self, properties: dict):
@@ -160,6 +191,12 @@ class VLLMHandler(AdapterFormatterMixin):
                 request_logger=None,
                 chat_template_config=ChatTemplateConfig(),
             )
+            self.embed_service = TensorServingEmbedding(
+                self.vllm_engine,
+                self.model_registry,
+                request_logger=None,
+                chat_template_config=ChatTemplateConfig(),
+            )
             self.normalize_embeddings = self.vllm_properties.normalize
             logger.info(
                 f"Embedding mode enabled (task={self.vllm_properties.task}, normalize={self.normalize_embeddings})"
@@ -219,8 +256,15 @@ class VLLMHandler(AdapterFormatterMixin):
         assert len(batch) == 1, "only one request per batch allowed"
         raw_request = batch[0]
         session = get_session(self.session_manager, raw_request)
-        content_type = raw_request.get_property("Content-Type")
-        decoded_payload = decode(raw_request, content_type)
+        typed_texts = read_embed_request(raw_request)
+        if typed_texts is not None:
+            if not self.is_embedding:
+                raise ValueError(
+                    "EmbedRequest is only valid for an embedding model")
+            decoded_payload = {"inputs": typed_texts}
+        else:
+            content_type = raw_request.get_property("Content-Type")
+            decoded_payload = decode(raw_request, content_type)
 
         adapter_name = _extract_lora_adapter(raw_request, decoded_payload)
 
@@ -266,10 +310,16 @@ class VLLMHandler(AdapterFormatterMixin):
                 # vLLM's use_activation controls L2 normalization in the pooler (vllm 0.19.x)
                 use_activation=self.normalize_embeddings,
             )
+            if typed_texts is not None:
+                invoker = self.embed_service
+                formatter = embed_output_formatter
+            else:
+                invoker = self.embedding_service
+                formatter = embedding_output_formatter
             processed_request = ProcessedRequest(
                 embedding_request,
-                self.embedding_service,
-                embedding_output_formatter,
+                invoker,
+                formatter,
                 None,
                 False,
                 False,

@@ -11,7 +11,7 @@
 # BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied. See the License for
 # the specific language governing permissions and limitations under the License.
 import json
-from typing import Callable, Tuple, Union, List, Dict
+from typing import Callable, Optional, Tuple, Union, List, Dict
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -27,6 +27,8 @@ from vllm.tokenizers import TokenizerLike
 
 from djl_python.outputs import Output
 from djl_python.async_utils import create_non_stream_output, create_stream_chunk_output
+from djl_python.embed_response import embed_response_bytes, float32_tensor_bytes
+from djl_python.inference_pb2 import EmbedRequest, EmbedResponse
 
 
 class ProcessedRequest:
@@ -304,10 +306,40 @@ def lmi_stream_output_formatter(
     return convert_completion_chunk_response_to_lmi_schema(chunk, **kwargs)
 
 
+PROTO_CONTENT_TYPE = "application/x-protobuf"
+
+
+def read_embed_request(inputs) -> Optional[List[str]]:
+    """Return EmbedRequest texts, or None when this request is JSON.
+
+    The bytes are the generated EmbedRequest message. HTTP and Predict do not
+    send that message.
+    """
+    content_type = ""
+    if hasattr(inputs, "get_property"):
+        content_type = inputs.get_property("Content-Type") or ""
+    key = EmbedRequest.DESCRIPTOR.full_name
+    has_key = hasattr(inputs, "contains_key") and inputs.contains_key(key)
+    if content_type != PROTO_CONTENT_TYPE and not has_key:
+        return None
+    if not has_key:
+        raise ValueError("EmbedRequest payload is missing")
+    blob = inputs.get_as_bytes(key=key)
+    if not blob:
+        raise ValueError("EmbedRequest payload is missing")
+    request = EmbedRequest()
+    try:
+        request.ParseFromString(bytes(blob))
+    except Exception as exc:
+        raise ValueError("EmbedRequest payload is invalid") from exc
+    return list(request.inputs)
+
+
 def embedding_output_formatter(response,
                                request=None,
                                tokenizer=None,
                                **_) -> Output:
+    """JSON matrix for HTTP and Predict. Embed does not use this formatter."""
     body = response.body
     if isinstance(body, bytes):
         body = body.decode('utf-8')
@@ -321,3 +353,40 @@ def embedding_output_formatter(response,
             "", error=f"Unexpected embedding response: {body}", code=500)
     embeddings = [item["embedding"] for item in parsed["data"]]
     return create_non_stream_output(json.dumps(embeddings))
+
+
+def embed_output_formatter(response,
+                           request=None,
+                           tokenizer=None,
+                           **_) -> Output:
+    """Copy each engine float32 buffer into EmbedResponse.
+
+    The async envelope's ``data`` string is empty. This does not dump or parse
+    the vectors as JSON.
+    """
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int) and status != 200:
+        body = getattr(response, "body", "") or ""
+        if isinstance(body, bytes):
+            body = body.decode("utf-8")
+        if not isinstance(body, str):
+            body = ""
+        error = getattr(response, "error", None)
+        message = getattr(error, "message", None)
+        if isinstance(message, str) and message:
+            body = message
+        return create_non_stream_output(
+            "", error=body or "embedding request failed", code=status)
+    tensors = getattr(response, "tensors", None)
+    if not isinstance(tensors, list) or not tensors:
+        return create_non_stream_output(
+            "", error="embedding response has no float vectors", code=500)
+    try:
+        rows = [(index, float32_tensor_bytes(tensor))
+                for index, tensor in enumerate(tensors)]
+    except ValueError as exc:
+        return create_non_stream_output("", error=str(exc), code=500)
+    output = create_non_stream_output("")
+    output.add(embed_response_bytes(200, rows),
+               key=EmbedResponse.DESCRIPTOR.full_name)
+    return output

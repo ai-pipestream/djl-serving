@@ -114,6 +114,7 @@ class Request {
                     error = value;
                     break;
                 default:
+                    // Float vectors are a raw content record, not a string in this envelope.
                     break;
             }
         }

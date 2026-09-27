@@ -12,6 +12,8 @@
  */
 package ai.djl.serving.grpc;
 
+import ai.djl.serving.grpc.proto.EmbedRequest;
+import ai.djl.serving.grpc.proto.EmbedResponse;
 import ai.djl.serving.grpc.proto.InferenceGrpc;
 import ai.djl.serving.grpc.proto.InferenceRequest;
 import ai.djl.serving.grpc.proto.InferenceResponse;
@@ -27,6 +29,7 @@ import io.grpc.ManagedChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -115,5 +118,38 @@ public class GrpcClient implements AutoCloseable {
         ByteString input = ByteString.copyFrom(data, StandardCharsets.UTF_8);
         InferenceRequest req = builder.setInput(input).build();
         return stub.predict(req);
+    }
+
+    /**
+     * Sends the {@code Embed} command to the server.
+     *
+     * @param modelName the model name
+     * @param inputs the texts to embed
+     * @return the embed response
+     */
+    public EmbedResponse embed(String modelName, List<String> inputs) {
+        return embed(modelName, null, inputs);
+    }
+
+    /**
+     * Sends the {@code Embed} command to the server.
+     *
+     * @param modelName the model name
+     * @param version the model version
+     * @param inputs the texts to embed
+     * @return the embed response
+     */
+    public EmbedResponse embed(String modelName, String version, List<String> inputs) {
+        EmbedRequest.Builder builder = EmbedRequest.newBuilder();
+        if (modelName != null) {
+            builder.setModelName(modelName);
+        }
+        if (version != null) {
+            builder.setModelVersion(version);
+        }
+        if (inputs != null) {
+            builder.addAllInputs(inputs);
+        }
+        return stub.embed(builder.build());
     }
 }
