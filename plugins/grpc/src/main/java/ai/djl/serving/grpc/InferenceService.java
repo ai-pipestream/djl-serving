@@ -17,6 +17,8 @@ import ai.djl.modality.Input;
 import ai.djl.modality.Output;
 import ai.djl.ndarray.BytesSupplier;
 import ai.djl.repository.zoo.ModelNotFoundException;
+import ai.djl.serving.grpc.proto.EmbedRequest;
+import ai.djl.serving.grpc.proto.EmbedResponse;
 import ai.djl.serving.grpc.proto.InferenceGrpc;
 import ai.djl.serving.grpc.proto.InferenceRequest;
 import ai.djl.serving.grpc.proto.InferenceResponse;
@@ -24,6 +26,7 @@ import ai.djl.serving.grpc.proto.PingResponse;
 import ai.djl.serving.http.StatusResponse;
 import ai.djl.serving.models.ModelManager;
 import ai.djl.serving.util.ConfigManager;
+import ai.djl.serving.wlm.util.WlmCapacityException;
 import ai.djl.serving.workflow.Workflow;
 import ai.djl.util.JsonUtils;
 
@@ -40,6 +43,8 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 class InferenceService extends InferenceGrpc.InferenceImplBase {
@@ -145,6 +150,60 @@ class InferenceService extends InferenceGrpc.InferenceImplBase {
                         });
     }
 
+    /** {@inheritDoc} */
+    @Override
+    public void embed(EmbedRequest request, StreamObserver<EmbedResponse> observer) {
+        if (invalidInputs(request)) {
+            observer.onError(
+                    Status.INVALID_ARGUMENT
+                            .withDescription("inputs must be non-empty strings")
+                            .asRuntimeException());
+            return;
+        }
+
+        String workflowName = request.getModelName();
+        String version = request.getModelVersion();
+        if (version.isEmpty()) {
+            version = null;
+        }
+        ModelManager modelManager = ModelManager.getInstance();
+        if (workflowName.isEmpty()) {
+            workflowName = ModelManager.getInstance().getSingleStartupWorkflow().orElse("");
+        }
+        Workflow workflow = modelManager.getWorkflow(workflowName, version, true);
+        if (workflow == null) {
+            ModelNotFoundException notFound =
+                    new ModelNotFoundException("Model or workflow not found: " + workflowName);
+            observer.onError(
+                    Status.NOT_FOUND
+                            .withDescription(notFound.getMessage())
+                            .withCause(notFound)
+                            .asRuntimeException());
+            return;
+        }
+
+        Input input = new Input();
+        input.addProperty("Content-Type", "application/json");
+        input.add(EmbedCodec.encodeRequest(request.getInputsList()));
+        modelManager
+                .runJob(workflow, input)
+                .whenCompleteAsync(
+                        (output, error) -> {
+                            if (error != null) {
+                                observer.onError(transportError(error));
+                                return;
+                            }
+                            if (output == null) {
+                                observer.onError(
+                                        transportError(
+                                                new IllegalStateException(
+                                                        "empty embedding result")));
+                                return;
+                            }
+                            completeEmbed(output, observer);
+                        });
+    }
+
     private Input parseInput(InferenceRequest req) {
         Input input = new Input();
         for (Map.Entry<String, ByteString> entry : req.getHeadersMap().entrySet()) {
@@ -198,5 +257,56 @@ class InferenceService extends InferenceGrpc.InferenceImplBase {
         }
         observer.onNext(builder.build());
         observer.onCompleted();
+    }
+
+    private static boolean invalidInputs(EmbedRequest request) {
+        if (request.getInputsCount() == 0) {
+            return true;
+        }
+        for (String text : request.getInputsList()) {
+            if (text == null || text.isBlank()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void completeEmbed(Output output, StreamObserver<EmbedResponse> observer) {
+        EmbedCodec.Result result = EmbedCodec.decode(output);
+        if (result.getFailure() != null) {
+            Status status =
+                    result.getFailure() == EmbedCodec.Failure.INTERNAL
+                            ? Status.INTERNAL
+                            : Status.FAILED_PRECONDITION;
+            observer.onError(status.withDescription(result.getDescription()).asRuntimeException());
+            return;
+        }
+        observer.onNext(result.getResponse());
+        observer.onCompleted();
+    }
+
+    private static RuntimeException transportError(Throwable error) {
+        Throwable cause = error;
+        while ((cause instanceof CompletionException || cause instanceof ExecutionException)
+                && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        String description = cause.getMessage();
+        if (description == null || description.isEmpty()) {
+            description = cause.getClass().getName();
+        }
+        if (cause instanceof ModelNotFoundException) {
+            return Status.NOT_FOUND
+                    .withDescription(description)
+                    .withCause(cause)
+                    .asRuntimeException();
+        }
+        if (cause instanceof WlmCapacityException) {
+            return Status.RESOURCE_EXHAUSTED
+                    .withDescription(description)
+                    .withCause(cause)
+                    .asRuntimeException();
+        }
+        return Status.UNKNOWN.withDescription(description).withCause(cause).asRuntimeException();
     }
 }
