@@ -107,6 +107,24 @@ public class EmbedCodecTest {
     }
 
     @Test
+    public void testEmptyVectorIsFailedPrecondition() {
+        byte[] blob =
+                EmbedResponse.newBuilder()
+                        .setCode(200)
+                        .addEmbeddings(Embedding.newBuilder().setIndex(0))
+                        .build()
+                        .toByteArray();
+        Output output = new Output();
+        output.add(EmbedCodec.responseKey(), blob);
+
+        EmbedCodec.Result result = EmbedCodec.decode(output);
+
+        Assert.assertEquals(result.getFailure(), EmbedCodec.Failure.FAILED_PRECONDITION);
+        Assert.assertEquals(result.getDescription(), "EmbedResponse vector is empty");
+        Assert.assertNull(result.getResponse());
+    }
+
+    @Test
     public void testErrorOutput() {
         Output output = new Output(503, "overloaded");
         output.add("[[0.1, 0.2]]");

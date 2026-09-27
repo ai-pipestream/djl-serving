@@ -16,6 +16,7 @@ import ai.djl.modality.Input;
 import ai.djl.modality.Output;
 import ai.djl.serving.grpc.proto.EmbedRequest;
 import ai.djl.serving.grpc.proto.EmbedResponse;
+import ai.djl.serving.grpc.proto.Embedding;
 
 import com.google.protobuf.InvalidProtocolBufferException;
 
@@ -68,6 +69,13 @@ final class EmbedCodec {
         }
         if (parsed.getCode() < ERROR_CODE && parsed.getEmbeddingsCount() == 0) {
             return failed("EmbedResponse payload is missing");
+        }
+        if (parsed.getCode() < ERROR_CODE) {
+            for (Embedding embedding : parsed.getEmbeddingsList()) {
+                if (embedding.getVectorCount() == 0) {
+                    return failed("EmbedResponse vector is empty");
+                }
+            }
         }
         return Result.response(parsed);
     }

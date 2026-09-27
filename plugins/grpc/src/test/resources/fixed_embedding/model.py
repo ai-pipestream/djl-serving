@@ -13,8 +13,13 @@
 """Fixed embedding fixture.
 
 Embed requests are serialized EmbedRequest messages. The reply Embed reads is
-a serialized EmbedResponse whose packed vector is ``FLOAT32_BUFFER``. Predict
-still receives ``[[0.25, 0.5]]`` as JSON. No torch and no GPU.
+a serialized EmbedResponse. Each input gets one packed vector, the float32
+bytes of 0.25 and 0.5. ``message`` echoes the inputs joined by newlines so a
+test can see the protobuf text round-trip. Predict still receives
+``[[0.25, 0.5]]`` as JSON. No torch and no GPU.
+
+Every non-empty call appends one line to ``INVOCATIONS``. A request rejected
+before ``runJob`` does not touch that file.
 """
 
 from djl_python import Input
@@ -26,12 +31,16 @@ from djl_python.inference_pb2 import EmbedRequest, EmbedResponse
 FLOAT32_BUFFER = bytes.fromhex("0000803e0000003f")
 PREDICT_BODY = "[[0.25, 0.5]]\n"
 PROTO_CONTENT_TYPE = "application/x-protobuf"
+INVOCATIONS = "/tmp/djl-grpc-fixed-embedding-calls"
 
 
 def handle(inputs: Input):
     """Return JSON for Predict, and EmbedResponse bytes for an EmbedRequest."""
     if inputs.is_empty():
         return None
+
+    with open(INVOCATIONS, "a", encoding="utf-8") as record:
+        record.write("1\n")
 
     outputs = Output()
     outputs.add_property("content-type", "application/json")
@@ -51,8 +60,10 @@ def handle(inputs: Input):
         return Output().error("EmbedRequest is empty")
     response = EmbedResponse()
     response.code = 200
-    embedding = response.embeddings.add()
-    embedding.index = 0
-    append_packed_float32(embedding, FLOAT32_BUFFER)
+    response.message = "\n".join(request.inputs)
+    for index, _text in enumerate(request.inputs):
+        embedding = response.embeddings.add()
+        embedding.index = index
+        append_packed_float32(embedding, FLOAT32_BUFFER)
     outputs.add(response.SerializeToString(), key=EmbedResponse.DESCRIPTOR.full_name)
     return outputs

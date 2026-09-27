@@ -25,8 +25,8 @@ def append_packed_float32(embedding, payload: bytes) -> None:
     A packed ``float`` field is the float32 bytes, so those bytes are merged
     into the generated message.
     """
-    if len(payload) % 4 != 0:
-        raise ValueError("float32 buffer length is not a multiple of 4")
+    if len(payload) == 0 or len(payload) % 4 != 0:
+        raise ValueError("float32 buffer length is not a positive multiple of 4")
     field = embedding.DESCRIPTOR.fields_by_name["vector"]
     encoded = bytearray(TagBytes(field.number, WIRETYPE_LENGTH_DELIMITED))
     _EncodeVarint(encoded.extend, len(payload))
