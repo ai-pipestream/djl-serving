@@ -14,6 +14,8 @@ package ai.djl.serving.grpc;
 
 import ai.djl.serving.Arguments;
 import ai.djl.serving.GrpcServer;
+import ai.djl.serving.grpc.proto.EmbedResponse;
+import ai.djl.serving.grpc.proto.Embedding;
 import ai.djl.serving.grpc.proto.InferenceResponse;
 import ai.djl.serving.grpc.proto.PingResponse;
 import ai.djl.serving.models.ModelManager;
@@ -21,6 +23,10 @@ import ai.djl.serving.util.ConfigManager;
 import ai.djl.serving.util.ModelStore;
 import ai.djl.serving.workflow.BadWorkflowException;
 import ai.djl.serving.workflow.Workflow;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.DefaultParser;
@@ -34,6 +40,7 @@ import org.testng.annotations.Test;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 
 public class GrpcTest {
@@ -48,7 +55,9 @@ public class GrpcTest {
             "-m",
             "../../engines/python/src/test/resources/rolling_batch",
             "-m",
-            "../../engines/python/src/test/resources/echo"
+            "../../engines/python/src/test/resources/echo",
+            "-m",
+            "src/test/resources/fixed_embedding"
         };
         CommandLine cmd = parser.parse(options, args, null, false);
         ConfigManager.init(new Arguments(cmd));
@@ -89,6 +98,35 @@ public class GrpcTest {
                 Assert.assertEquals(resp.getHeadersCount(), 1);
                 Assert.assertEquals(resp.getOutput().toString(StandardCharsets.UTF_8), "hello");
                 String contentType =
+                        resp.getHeadersOrThrow("content-type").toString(StandardCharsets.UTF_8);
+                Assert.assertEquals(contentType, "application/json");
+
+                EmbedResponse embed =
+                        client.embed("fixed_embedding", List.of("What is Deep Learning?"));
+                Assert.assertEquals(embed.getCode(), 200);
+                Assert.assertEquals(embed.getEmbeddingsCount(), 1);
+                Embedding row = embed.getEmbeddings(0);
+                Assert.assertEquals(row.getIndex(), 0);
+                Assert.assertEquals(row.getVectorCount(), 2);
+                Assert.assertEquals(row.getVector(0), 0.25f, 1.0e-6f);
+                Assert.assertEquals(row.getVector(1), 0.5f, 1.0e-6f);
+
+                it =
+                        client.inference(
+                                "fixed_embedding", "{\"inputs\": [\"What is Deep Learning?\"]}");
+                resp = it.next();
+                Assert.assertEquals(resp.getCode(), 200);
+                Assert.assertFalse(it.hasNext());
+                String predictBody = resp.getOutput().toString(StandardCharsets.UTF_8);
+                JsonElement parsed = JsonParser.parseString(predictBody);
+                Assert.assertTrue(parsed.isJsonArray());
+                JsonArray matrix = parsed.getAsJsonArray();
+                Assert.assertEquals(matrix.size(), 1);
+                JsonArray vector = matrix.get(0).getAsJsonArray();
+                Assert.assertEquals(vector.size(), 2);
+                Assert.assertEquals(vector.get(0).getAsFloat(), 0.25f, 1.0e-6f);
+                Assert.assertEquals(vector.get(1).getAsFloat(), 0.5f, 1.0e-6f);
+                contentType =
                         resp.getHeadersOrThrow("content-type").toString(StandardCharsets.UTF_8);
                 Assert.assertEquals(contentType, "application/json");
 

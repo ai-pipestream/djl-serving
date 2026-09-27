@@ -221,3 +221,41 @@ When using dynamic batching, errors are returned with HTTP response code 400 and
   "message": "Missing \"inputs\" in json."
 }
 ```
+
+## gRPC Embed
+
+The same model answers a unary gRPC call, `Inference.Embed`, on the service that already serves `Ping` and `Predict`. HTTP `POST /predictions/{model}` and `POST /invocations` still return the JSON array of vectors. `Predict` still returns that JSON body. `Embed` returns the same vectors as packed `float` values in one `EmbedResponse`.
+
+`EmbedRequest` fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `model_name` | string | Model name. An empty name uses the single startup model. |
+| `model_version` | string, optional | Model version. An empty version uses the default. |
+| `inputs` | repeated string | One text, or several. |
+
+The service sends the model the same JSON an HTTP client posts. One text is a one-element list:
+
+```json
+{"inputs": ["What is Deep Learning?"]}
+```
+
+An empty `inputs` list, or a blank string, is rejected with `INVALID_ARGUMENT` and is not sent to the model. A missing model is `NOT_FOUND`.
+
+`EmbedResponse` fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `code` | int32 | Status from the worker. `200` when the vectors are present. |
+| `message` | string | Worker message, set when `code` reports an error. |
+| `embeddings` | repeated `Embedding` | One message per row. |
+
+Each `Embedding` has `index` (the row position) and `vector` (packed `float` values). Every vector in one response has the same length.
+
+```java
+EmbedResponse response = client.embed(modelName, List.of("What is Deep Learning?"));
+Embedding row = response.getEmbeddings(0);
+List<Float> vector = row.getVectorList();
+```
+
+`Embed` runs on the workers already configured for that model. On GPU, keep the single-worker setting from the deployment section above. Rust, ONNX, and PyTorch models keep returning a JSON matrix; `Embed` reads those floats from that JSON.
