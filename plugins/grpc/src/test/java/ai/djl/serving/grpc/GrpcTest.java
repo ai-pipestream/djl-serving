@@ -28,6 +28,9 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonParser;
 
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Options;
@@ -57,7 +60,9 @@ public class GrpcTest {
             "-m",
             "../../engines/python/src/test/resources/echo",
             "-m",
-            "src/test/resources/fixed_embedding"
+            "src/test/resources/fixed_embedding",
+            "-m",
+            "src/test/resources/json_only_embedding"
         };
         CommandLine cmd = parser.parse(options, args, null, false);
         ConfigManager.init(new Arguments(cmd));
@@ -129,6 +134,27 @@ public class GrpcTest {
                 contentType =
                         resp.getHeadersOrThrow("content-type").toString(StandardCharsets.UTF_8);
                 Assert.assertEquals(contentType, "application/json");
+
+                it =
+                        client.inference(
+                                "json_only_embedding",
+                                "{\"inputs\": [\"What is Deep Learning?\"]}");
+                resp = it.next();
+                Assert.assertEquals(resp.getCode(), 200);
+                Assert.assertFalse(it.hasNext());
+                parsed = JsonParser.parseString(resp.getOutput().toString(StandardCharsets.UTF_8));
+                Assert.assertTrue(parsed.isJsonArray());
+                StatusRuntimeException jsonOnly =
+                        Assert.expectThrows(
+                                StatusRuntimeException.class,
+                                () ->
+                                        client.embed(
+                                                "json_only_embedding",
+                                                List.of("What is Deep Learning?")));
+                Assert.assertEquals(
+                        jsonOnly.getStatus().getCode(), Status.Code.FAILED_PRECONDITION);
+                Assert.assertEquals(
+                        jsonOnly.getStatus().getDescription(), "embedding-f32 payload is missing");
 
                 Iterator<InferenceResponse> ret = client.inference("invalid", "v1", headers, "");
                 Assert.assertThrows(ret::next);

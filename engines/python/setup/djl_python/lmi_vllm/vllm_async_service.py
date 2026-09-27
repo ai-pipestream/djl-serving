@@ -52,6 +52,7 @@ from djl_python.lmi_vllm.request_response_utils import (
     lmi_with_details_non_stream_output_formatter,
     lmi_non_stream_output_formatter,
     embedding_output_formatter,
+    read_embed_texts,
 )
 from djl_python.session_manager import SessionManager
 from djl_python.session_utils import (create_session, close_session,
@@ -219,8 +220,15 @@ class VLLMHandler(AdapterFormatterMixin):
         assert len(batch) == 1, "only one request per batch allowed"
         raw_request = batch[0]
         session = get_session(self.session_manager, raw_request)
-        content_type = raw_request.get_property("Content-Type")
-        decoded_payload = decode(raw_request, content_type)
+        typed_texts = read_embed_texts(raw_request)
+        if typed_texts is not None:
+            if not self.is_embedding:
+                raise ValueError(
+                    "embed-texts is only valid for an embedding model")
+            decoded_payload = {"inputs": typed_texts}
+        else:
+            content_type = raw_request.get_property("Content-Type")
+            decoded_payload = decode(raw_request, content_type)
 
         adapter_name = _extract_lora_adapter(raw_request, decoded_payload)
 

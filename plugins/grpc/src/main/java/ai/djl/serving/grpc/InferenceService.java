@@ -183,8 +183,7 @@ class InferenceService extends InferenceGrpc.InferenceImplBase {
         }
 
         Input input = new Input();
-        input.addProperty("Content-Type", "application/json");
-        input.add(EmbedCodec.encodeRequest(request.getInputsList()));
+        EmbedCodec.applyRequest(input, request.getInputsList());
         modelManager
                 .runJob(workflow, input)
                 .whenCompleteAsync(
@@ -272,13 +271,27 @@ class InferenceService extends InferenceGrpc.InferenceImplBase {
     }
 
     private static void completeEmbed(Output output, StreamObserver<EmbedResponse> observer) {
+        BytesSupplier data = output.getData();
+        if (data instanceof ChunkedBytesSupplier) {
+            try {
+                // The async worker signals completion on this body. Embed does not parse it.
+                ((ChunkedBytesSupplier) data).getAsBytes();
+            } catch (RuntimeException | AssertionError e) {
+                String description = e.getMessage();
+                if (description == null || description.isEmpty()) {
+                    description = e.getClass().getName();
+                }
+                observer.onError(
+                        Status.UNKNOWN.withDescription(description).withCause(e).asRuntimeException());
+                return;
+            }
+        }
         EmbedCodec.Result result = EmbedCodec.decode(output);
         if (result.getFailure() != null) {
-            Status status =
-                    result.getFailure() == EmbedCodec.Failure.INTERNAL
-                            ? Status.INTERNAL
-                            : Status.FAILED_PRECONDITION;
-            observer.onError(status.withDescription(result.getDescription()).asRuntimeException());
+            observer.onError(
+                    Status.FAILED_PRECONDITION
+                            .withDescription(result.getDescription())
+                            .asRuntimeException());
             return;
         }
         observer.onNext(result.getResponse());

@@ -12,18 +12,10 @@
  */
 package ai.djl.serving.grpc;
 
+import ai.djl.modality.Input;
 import ai.djl.modality.Output;
-import ai.djl.ndarray.BytesSupplier;
 import ai.djl.serving.grpc.proto.EmbedResponse;
 import ai.djl.serving.grpc.proto.Embedding;
-import ai.djl.util.JsonUtils;
-import ai.djl.util.Pair;
-
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParseException;
-import com.google.gson.JsonParser;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,83 +24,85 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.Optional;
 
 /**
  * Encodes embed requests and decodes worker outputs.
  *
- * <p>The binary content key {@code embedding-f32} is tried first. JSON in {@code Output.getData()}
- * is the fallback, and a disagreement between the two is reported as an internal failure.
+ * <p>Texts go to the worker as the {@code embed-texts} content key. Vectors come back only from
+ * the {@code embedding-f32} content key. This class does not build or parse JSON.
  */
 final class EmbedCodec {
 
     static final String BINARY_KEY = "embedding-f32";
+    static final String TEXTS_KEY = "embed-texts";
+    static final String TEXTS_CONTENT_TYPE = "application/x-embedding-texts";
 
     private static final Logger logger = LoggerFactory.getLogger(EmbedCodec.class);
 
     private static final int VERSION = 1;
     private static final int HEADER_BYTES = 12;
+    private static final int TEXT_HEADER_BYTES = 8;
     private static final int ERROR_CODE = 300;
-    private static final float VALUE_TOLERANCE = 1.0e-6f;
 
     private EmbedCodec() {}
 
-    static byte[] encodeRequest(List<String> inputs) {
-        JsonArray array = new JsonArray();
-        for (String text : inputs) {
-            array.add(text);
+    /** Writes the repeated texts as a typed content payload. */
+    static void applyRequest(Input input, List<String> inputs) {
+        input.addProperty("Content-Type", TEXTS_CONTENT_TYPE);
+        input.add(TEXTS_KEY, encodeTexts(inputs));
+    }
+
+    /**
+     * Little-endian layout: version 1, text count, then each text as a byte length and UTF-8
+     * bytes.
+     */
+    static byte[] encodeTexts(List<String> inputs) {
+        byte[][] encoded = new byte[inputs.size()][];
+        int size = TEXT_HEADER_BYTES;
+        for (int i = 0; i < inputs.size(); i++) {
+            encoded[i] = inputs.get(i).getBytes(StandardCharsets.UTF_8);
+            size += Integer.BYTES + encoded[i].length;
         }
-        JsonObject body = new JsonObject();
-        body.add("inputs", array);
-        return JsonUtils.GSON_COMPACT.toJson(body).getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putInt(VERSION);
+        buffer.putInt(encoded.length);
+        for (byte[] text : encoded) {
+            buffer.putInt(text.length);
+            buffer.put(text);
+        }
+        return buffer.array();
     }
 
     static Result decode(Output output) {
         if (output.getCode() >= ERROR_CODE) {
             return Result.response(errorResponse(output));
         }
-        Optional<float[][]> binary = readBinary(output);
-        byte[] json = jsonPayload(output);
-        if (binary.isPresent()) {
-            return finishBinary(output, binary.get(), json);
-        }
-        return finishJson(output, json);
-    }
-
-    private static Optional<float[][]> readBinary(Output output) {
         byte[] blob = output.getAsBytes(BINARY_KEY);
         if (blob == null) {
-            return Optional.empty();
+            return failed("embedding-f32 payload is missing");
         }
-        return parseBinary(blob);
+        return decodeBlob(output, blob);
     }
 
-    private static Optional<float[][]> parseBinary(byte[] blob) {
+    private static Result decodeBlob(Output output, byte[] blob) {
         if (blob.length < HEADER_BYTES) {
-            logger.warn("embedding-f32 payload is truncated, falling back to JSON");
-            return Optional.empty();
+            return failed("embedding-f32 payload is truncated");
         }
         ByteBuffer buffer = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN);
         int version = buffer.getInt();
         int count = buffer.getInt();
         int dimension = buffer.getInt();
         if (version != VERSION) {
-            logger.warn("embedding-f32 version {} is unsupported, falling back to JSON", version);
-            return Optional.empty();
+            return failed("embedding-f32 version is unsupported");
         }
         if (count < 1 || dimension < 1) {
-            logger.warn("embedding-f32 count or dimension is invalid, falling back to JSON");
-            return Optional.empty();
+            return failed("embedding-f32 count or dimension is invalid");
         }
         long vectorCount = count;
         long vectorDimension = dimension;
-        long floats = vectorCount * vectorDimension;
-        long expected = HEADER_BYTES + floats * Float.BYTES;
+        long expected = HEADER_BYTES + vectorCount * vectorDimension * Float.BYTES;
         if (expected != blob.length) {
-            logger.warn(
-                    "embedding-f32 length does not match count and dimension, falling back to"
-                            + " JSON");
-            return Optional.empty();
+            return failed("embedding-f32 length does not match count and dimension");
         }
         float[][] vectors = new float[count][dimension];
         for (int i = 0; i < count; i++) {
@@ -116,122 +110,12 @@ final class EmbedCodec {
                 vectors[i][j] = buffer.getFloat();
             }
         }
-        return Optional.of(vectors);
+        return Result.response(vectorsResponse(output, vectors));
     }
 
-    /** A well-formed blob is the result. JSON is parsed only to detect a formatter mismatch. */
-    private static Result finishBinary(Output output, float[][] binary, byte[] json) {
-        if (json.length == 0) {
-            return Result.response(vectorsResponse(output, binary));
-        }
-        float[][] parsed;
-        try {
-            parsed = parseJson(json);
-        } catch (BadMatrixException e) {
-            logger.warn(
-                    "embedding-f32 is well formed but JSON is not a matrix: {}", e.getMessage());
-            return Result.internal("embedding-f32 does not match JSON embeddings");
-        }
-        if (!sameVectors(binary, parsed)) {
-            return Result.internal("embedding-f32 does not match JSON embeddings");
-        }
-        return Result.response(vectorsResponse(output, binary));
-    }
-
-    private static Result finishJson(Output output, byte[] json) {
-        if (json.length == 0) {
-            return Result.failedPrecondition("embedding JSON is empty");
-        }
-        try {
-            return Result.response(vectorsResponse(output, parseJson(json)));
-        } catch (BadMatrixException e) {
-            return Result.failedPrecondition(e.getMessage());
-        }
-    }
-
-    private static byte[] jsonPayload(Output output) {
-        for (Pair<String, BytesSupplier> entry : output.getContent()) {
-            if (BINARY_KEY.equals(entry.getKey())) {
-                continue;
-            }
-            BytesSupplier supplier = entry.getValue();
-            if (supplier == null) {
-                continue;
-            }
-            byte[] bytes = supplier.getAsBytes();
-            if (bytes != null && bytes.length > 0) {
-                return bytes;
-            }
-        }
-        return new byte[0];
-    }
-
-    private static float[][] parseJson(byte[] json) {
-        JsonElement root;
-        try {
-            root = JsonParser.parseString(new String(json, StandardCharsets.UTF_8));
-        } catch (JsonParseException e) {
-            throw new BadMatrixException("embedding JSON is not a numeric matrix", e);
-        }
-        if (root == null || !root.isJsonArray()) {
-            throw new BadMatrixException("embedding JSON is not a numeric matrix");
-        }
-        JsonArray rows = root.getAsJsonArray();
-        float[][] vectors = new float[rows.size()][];
-        int dimension = -1;
-        for (int i = 0; i < rows.size(); i++) {
-            JsonElement rowElement = rows.get(i);
-            if (rowElement == null || !rowElement.isJsonArray()) {
-                throw new BadMatrixException("embedding JSON is not a numeric matrix");
-            }
-            JsonArray row = rowElement.getAsJsonArray();
-            if (dimension < 0) {
-                dimension = row.size();
-                if (dimension < 1) {
-                    throw new BadMatrixException("embedding dimension must be positive");
-                }
-            } else if (row.size() != dimension) {
-                throw new BadMatrixException("embedding vectors have different dimensions");
-            }
-            float[] vector = new float[dimension];
-            for (int j = 0; j < dimension; j++) {
-                vector[j] = readNumber(row.get(j));
-            }
-            vectors[i] = vector;
-        }
-        return vectors;
-    }
-
-    private static float readNumber(JsonElement value) {
-        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
-            throw new BadMatrixException("embedding JSON is not a numeric matrix");
-        }
-        return value.getAsFloat();
-    }
-
-    private static boolean sameVectors(float[][] left, float[][] right) {
-        if (left.length != right.length) {
-            return false;
-        }
-        for (int i = 0; i < left.length; i++) {
-            if (left[i].length != right[i].length) {
-                return false;
-            }
-            for (int j = 0; j < left[i].length; j++) {
-                if (!close(left[i][j], right[i][j])) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    private static boolean close(float left, float right) {
-        if (Float.floatToIntBits(left) == Float.floatToIntBits(right)) {
-            return true;
-        }
-        float delta = left - right;
-        return delta <= VALUE_TOLERANCE && delta >= -VALUE_TOLERANCE;
+    private static Result failed(String description) {
+        logger.warn("Rejected embedding payload: {}", description);
+        return Result.failedPrecondition(description);
     }
 
     private static EmbedResponse errorResponse(Output output) {
@@ -258,8 +142,7 @@ final class EmbedCodec {
     }
 
     enum Failure {
-        FAILED_PRECONDITION,
-        INTERNAL
+        FAILED_PRECONDITION
     }
 
     static final class Result {
@@ -282,10 +165,6 @@ final class EmbedCodec {
             return new Result(null, Failure.FAILED_PRECONDITION, description);
         }
 
-        static Result internal(String description) {
-            return new Result(null, Failure.INTERNAL, description);
-        }
-
         EmbedResponse getResponse() {
             return response;
         }
@@ -296,19 +175,6 @@ final class EmbedCodec {
 
         String getDescription() {
             return description;
-        }
-    }
-
-    private static final class BadMatrixException extends RuntimeException {
-
-        private static final long serialVersionUID = 1L;
-
-        private BadMatrixException(String message) {
-            super(message);
-        }
-
-        private BadMatrixException(String message, Throwable cause) {
-            super(message, cause);
         }
     }
 }

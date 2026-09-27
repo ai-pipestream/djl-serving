@@ -25,7 +25,6 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
@@ -98,7 +97,6 @@ class Request {
         int size = buf.readShort();
         String code = null;
         String error = null;
-        String embeddingF32 = null;
         for (int i = 0; i < size; ++i) {
             String key = Objects.requireNonNull(CodecUtils.readUtf8(buf));
             String value = Objects.requireNonNull(CodecUtils.readUtf8(buf));
@@ -115,10 +113,8 @@ class Request {
                 case "error":
                     error = value;
                     break;
-                case "embedding_f32":
-                    embeddingF32 = value;
-                    break;
                 default:
+                    // Float vectors are a raw content record, not a string in this envelope.
                     break;
             }
         }
@@ -138,9 +134,6 @@ class Request {
             byte[] buffer = JsonUtils.GSON.toJson(map).getBytes(StandardCharsets.UTF_8);
             data.appendContent(buffer, true);
         } else {
-            if (embeddingF32 != null) {
-                output.add("embedding-f32", Base64.getDecoder().decode(embeddingF32));
-            }
             if (last && metrics != null) {
                 long duration = System.nanoTime() - creationTime;
                 double throughput = count * 1_000_000_000d / duration;

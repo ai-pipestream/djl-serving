@@ -12,13 +12,10 @@
  */
 package ai.djl.serving.grpc;
 
+import ai.djl.modality.Input;
 import ai.djl.modality.Output;
 import ai.djl.serving.grpc.proto.EmbedResponse;
 import ai.djl.serving.grpc.proto.Embedding;
-
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonParser;
 
 import org.testng.Assert;
 import org.testng.annotations.Test;
@@ -31,38 +28,38 @@ import java.util.List;
 public class EmbedCodecTest {
 
     @Test
-    public void testEncodeRequestJson() {
-        byte[] encoded = EmbedCodec.encodeRequest(List.of("first text", "second \"text\""));
-        JsonElement root = JsonParser.parseString(new String(encoded, StandardCharsets.UTF_8));
-        Assert.assertTrue(root.isJsonObject());
-        Assert.assertEquals(root.getAsJsonObject().size(), 1);
-        JsonArray inputs = root.getAsJsonObject().getAsJsonArray("inputs");
-        Assert.assertEquals(inputs.size(), 2);
-        Assert.assertEquals(inputs.get(0).getAsString(), "first text");
-        Assert.assertEquals(inputs.get(1).getAsString(), "second \"text\"");
+    public void testEncodeRequestTexts() {
+        byte[] encoded = EmbedCodec.encodeTexts(List.of("first text", "second \"text\"", "café"));
+        ByteBuffer buffer = ByteBuffer.wrap(encoded).order(ByteOrder.LITTLE_ENDIAN);
+        Assert.assertEquals(buffer.getInt(), 1);
+        Assert.assertEquals(buffer.getInt(), 3);
+        Assert.assertEquals(readUtf8(buffer), "first text");
+        Assert.assertEquals(readUtf8(buffer), "second \"text\"");
+        Assert.assertEquals(readUtf8(buffer), "café");
+        Assert.assertFalse(buffer.hasRemaining());
 
-        byte[] single = EmbedCodec.encodeRequest(List.of("only"));
-        JsonArray one =
-                JsonParser.parseString(new String(single, StandardCharsets.UTF_8))
-                        .getAsJsonObject()
-                        .getAsJsonArray("inputs");
-        Assert.assertEquals(one.size(), 1);
-        Assert.assertEquals(one.get(0).getAsString(), "only");
+        Input input = new Input();
+        EmbedCodec.applyRequest(input, List.of("only"));
+        Assert.assertEquals(
+                input.getProperty("Content-Type", ""), EmbedCodec.TEXTS_CONTENT_TYPE);
+        byte[] payload = input.getAsBytes(EmbedCodec.TEXTS_KEY);
+        ByteBuffer one = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
+        Assert.assertEquals(one.getInt(), 1);
+        Assert.assertEquals(one.getInt(), 1);
+        Assert.assertEquals(readUtf8(one), "only");
+        Assert.assertFalse(one.hasRemaining());
     }
 
     @Test
-    public void testJsonMatrix() {
+    public void testJsonOnlyIsFailedPrecondition() {
         Output output = new Output();
         output.add("[[0.1, 0.2], [0.3, 0.4]]");
 
         EmbedCodec.Result result = EmbedCodec.decode(output);
 
-        Assert.assertNull(result.getFailure());
-        EmbedResponse response = result.getResponse();
-        Assert.assertEquals(response.getCode(), 200);
-        Assert.assertEquals(response.getEmbeddingsCount(), 2);
-        assertVector(response.getEmbeddings(0), 0, 0.1f, 0.2f);
-        assertVector(response.getEmbeddings(1), 1, 0.3f, 0.4f);
+        Assert.assertEquals(result.getFailure(), EmbedCodec.Failure.FAILED_PRECONDITION);
+        Assert.assertEquals(result.getDescription(), "embedding-f32 payload is missing");
+        Assert.assertNull(result.getResponse());
     }
 
     @Test
@@ -82,27 +79,19 @@ public class EmbedCodecTest {
     }
 
     @Test
-    public void testBinaryPreferredWithinTolerance() {
-        float binaryValue = 1.0f;
-        float jsonValue = binaryValue + 5.0e-7f;
-        Assert.assertNotEquals(Float.floatToIntBits(binaryValue), Float.floatToIntBits(jsonValue));
-        Assert.assertTrue(Math.abs(binaryValue - jsonValue) <= 1.0e-6f);
-
+    public void testBlobIgnoresJsonBody() {
         Output output = new Output();
-        output.add("[[" + Float.toString(jsonValue) + "]]");
-        output.add(EmbedCodec.BINARY_KEY, blob(1, new float[][] {{binaryValue}}));
+        output.add("[[9.0, 9.0]]");
+        output.add(EmbedCodec.BINARY_KEY, blob(1, new float[][] {{0.25f, 0.5f}}));
 
         EmbedCodec.Result result = EmbedCodec.decode(output);
 
         Assert.assertNull(result.getFailure());
-        Assert.assertEquals(
-                Float.floatToIntBits(result.getResponse().getEmbeddings(0).getVector(0)),
-                Float.floatToIntBits(binaryValue));
+        assertVector(result.getResponse().getEmbeddings(0), 0, 0.25f, 0.5f);
     }
 
     @Test
-    public void testCorruptBlobFallsBack() {
-        float[][] jsonVectors = {{0.25f, 0.5f}};
+    public void testCorruptBlobIsError() {
         String json = "[[0.25, 0.5]]";
 
         Output truncated = new Output();
@@ -111,7 +100,7 @@ public class EmbedCodecTest {
 
         Output wrongVersion = new Output();
         wrongVersion.add(json);
-        wrongVersion.add(EmbedCodec.BINARY_KEY, blob(2, new float[][] {{9.0f, 9.0f}}));
+        wrongVersion.add(EmbedCodec.BINARY_KEY, blob(2, new float[][] {{0.25f, 0.5f}}));
 
         ByteBuffer extra = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN);
         extra.putInt(1);
@@ -123,39 +112,30 @@ public class EmbedCodecTest {
         lengthMismatch.add(json);
         lengthMismatch.add(EmbedCodec.BINARY_KEY, extra.array());
 
-        for (Output output : List.of(truncated, wrongVersion, lengthMismatch)) {
-            EmbedCodec.Result result = EmbedCodec.decode(output);
-            Assert.assertNull(result.getFailure());
-            EmbedResponse response = result.getResponse();
-            Assert.assertEquals(response.getEmbeddingsCount(), 1);
-            assertVector(response.getEmbeddings(0), 0, jsonVectors[0][0], jsonVectors[0][1]);
-        }
-    }
+        Output badShape = new Output();
+        badShape.add(json);
+        ByteBuffer zeroCount = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
+        zeroCount.putInt(1);
+        zeroCount.putInt(0);
+        zeroCount.putInt(2);
+        badShape.add(EmbedCodec.BINARY_KEY, zeroCount.array());
 
-    @Test
-    public void testCountMismatchIsInternal() {
-        Output output = new Output();
-        output.add("[[0.1, 0.2], [0.3, 0.4]]");
-        output.add(EmbedCodec.BINARY_KEY, blob(1, new float[][] {{0.1f, 0.2f}}));
-
-        EmbedCodec.Result result = EmbedCodec.decode(output);
-
-        Assert.assertEquals(result.getFailure(), EmbedCodec.Failure.INTERNAL);
-        Assert.assertNull(result.getResponse());
         Assert.assertEquals(
-                result.getDescription(), "embedding-f32 does not match JSON embeddings");
-    }
-
-    @Test
-    public void testValueMismatchIsInternal() {
-        Output output = new Output();
-        output.add("[[0.9, 0.2]]");
-        output.add(EmbedCodec.BINARY_KEY, blob(1, new float[][] {{0.1f, 0.2f}}));
-
-        EmbedCodec.Result result = EmbedCodec.decode(output);
-
-        Assert.assertEquals(result.getFailure(), EmbedCodec.Failure.INTERNAL);
-        Assert.assertNull(result.getResponse());
+                EmbedCodec.decode(truncated).getDescription(), "embedding-f32 payload is truncated");
+        Assert.assertEquals(
+                EmbedCodec.decode(wrongVersion).getDescription(),
+                "embedding-f32 version is unsupported");
+        Assert.assertEquals(
+                EmbedCodec.decode(lengthMismatch).getDescription(),
+                "embedding-f32 length does not match count and dimension");
+        Assert.assertEquals(
+                EmbedCodec.decode(badShape).getDescription(),
+                "embedding-f32 count or dimension is invalid");
+        for (Output output : List.of(truncated, wrongVersion, lengthMismatch, badShape)) {
+            EmbedCodec.Result result = EmbedCodec.decode(output);
+            Assert.assertEquals(result.getFailure(), EmbedCodec.Failure.FAILED_PRECONDITION);
+            Assert.assertNull(result.getResponse());
+        }
     }
 
     @Test
@@ -173,31 +153,19 @@ public class EmbedCodecTest {
         Assert.assertEquals(response.getEmbeddingsCount(), 0);
     }
 
-    @Test
-    public void testBadJsonIsFailedPrecondition() {
-        Output ragged = new Output();
-        ragged.add("[[0.1, 0.2], [0.3]]");
-        EmbedCodec.Result raggedResult = EmbedCodec.decode(ragged);
-        Assert.assertEquals(raggedResult.getFailure(), EmbedCodec.Failure.FAILED_PRECONDITION);
-        Assert.assertEquals(
-                raggedResult.getDescription(), "embedding vectors have different dimensions");
-        Assert.assertNull(raggedResult.getResponse());
-
-        Output object = new Output();
-        object.add("{\"embeddings\": [[0.1, 0.2]]}");
-        EmbedCodec.Result objectResult = EmbedCodec.decode(object);
-        Assert.assertEquals(objectResult.getFailure(), EmbedCodec.Failure.FAILED_PRECONDITION);
-        Assert.assertEquals(
-                objectResult.getDescription(), "embedding JSON is not a numeric matrix");
-        Assert.assertNull(objectResult.getResponse());
-    }
-
     private static void assertVector(Embedding embedding, int index, float... expected) {
         Assert.assertEquals(embedding.getIndex(), index);
         Assert.assertEquals(embedding.getVectorCount(), expected.length);
         for (int i = 0; i < expected.length; i++) {
             Assert.assertEquals(embedding.getVector(i), expected[i], 0.0f);
         }
+    }
+
+    private static String readUtf8(ByteBuffer buffer) {
+        int length = buffer.getInt();
+        byte[] bytes = new byte[length];
+        buffer.get(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     private static byte[] blob(int version, float[][] vectors) {

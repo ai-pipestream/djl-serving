@@ -34,6 +34,7 @@ class AsyncRequestManager {
     private static final Logger logger = LoggerFactory.getLogger(AsyncRequestManager.class);
     private static final Logger MODEL_METRIC = LoggerFactory.getLogger("model_metric");
     private static final String REQUEST_TRACKING_ID = "request_tracking_id";
+    private static final String EMBEDDING_KEY = "embedding-f32";
 
     private Dimension dimension;
     private Metrics metrics;
@@ -135,6 +136,12 @@ class AsyncRequestManager {
         if (request == null) {
             logger.warn("Received response for unknown request tracking ID: {}", requestTrackingId);
             return;
+        }
+        // Raw float32 record. Copy it before the envelope's last chunk unblocks readers.
+        // Do not base64-decode a string out of the JSON data envelope.
+        byte[] floats = output.getAsBytes(EMBEDDING_KEY);
+        if (floats != null && request.output.getAsBytes(EMBEDDING_KEY) == null) {
+            request.output.add(EMBEDDING_KEY, floats);
         }
         request.addResponse(responseContent, prop);
         if (request.last) {

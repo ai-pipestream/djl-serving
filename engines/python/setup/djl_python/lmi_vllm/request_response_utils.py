@@ -11,11 +11,10 @@
 # BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied. See the License for
 # the specific language governing permissions and limitations under the License.
 import array
-import base64
 import json
 import struct
 import sys
-from typing import Callable, Tuple, Union, List, Dict
+from typing import Callable, Optional, Tuple, Union, List, Dict
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -323,6 +322,50 @@ def _embedding_matrix_shape(embeddings: List):
     return len(embeddings), dimension
 
 
+EMBED_TEXTS_KEY = "embed-texts"
+EMBED_TEXTS_CONTENT_TYPE = "application/x-embedding-texts"
+
+
+def read_embed_texts(inputs) -> Optional[List[str]]:
+    """Return typed Embed texts, or None when this request is JSON.
+
+    Layout is little-endian: version 1, text count, then each text as an
+    int32 byte length and UTF-8 bytes. HTTP and Predict do not use this key.
+    """
+    content_type = ""
+    if hasattr(inputs, "get_property"):
+        content_type = inputs.get_property("Content-Type") or ""
+    has_key = hasattr(inputs, "contains_key") and inputs.contains_key(
+        EMBED_TEXTS_KEY)
+    if content_type != EMBED_TEXTS_CONTENT_TYPE and not has_key:
+        return None
+    return _decode_embed_texts(inputs.get_as_bytes(key=EMBED_TEXTS_KEY))
+
+
+def _decode_embed_texts(blob: bytes) -> List[str]:
+    if blob is None or len(blob) < 8:
+        raise ValueError("embed-texts payload is truncated")
+    version, count = struct.unpack_from("<ii", blob, 0)
+    if version != 1:
+        raise ValueError("embed-texts version is unsupported")
+    if count < 1:
+        raise ValueError("embed-texts count is invalid")
+    offset = 8
+    texts = []
+    for _ in range(count):
+        if offset + 4 > len(blob):
+            raise ValueError("embed-texts payload is truncated")
+        (length,) = struct.unpack_from("<i", blob, offset)
+        offset += 4
+        if length < 0 or offset + length > len(blob):
+            raise ValueError("embed-texts payload is truncated")
+        texts.append(blob[offset:offset + length].decode("utf-8"))
+        offset += length
+    if offset != len(blob):
+        raise ValueError("embed-texts length does not match count")
+    return texts
+
+
 def _embedding_f32_blob(embeddings: List, count: int, dimension: int) -> bytes:
     """Little-endian layout: version 1, vector count, dimension, row-major float32."""
     flat = array.array("f")
@@ -334,10 +377,11 @@ def _embedding_f32_blob(embeddings: List, count: int, dimension: int) -> bytes:
 
 
 def create_embedding_non_stream_output(embeddings: List) -> Output:
-    """Same JSON envelope as create_non_stream_output, plus embedding_f32.
+    """JSON ``data`` for HTTP and Predict, plus a raw ``embedding-f32`` record.
 
-    ``data`` stays ``json.dumps`` of the vector list. The side channel is
-    omitted when the list is empty or ragged so HTTP JSON is unchanged.
+    The float record is little-endian bytes on its own content key. It is not
+    base64 and it is not a field of the string envelope. The record is omitted
+    when the list is empty or ragged so the HTTP JSON body is unchanged.
     """
     data = json.dumps(embeddings)
     shape = _embedding_matrix_shape(embeddings)
@@ -347,14 +391,8 @@ def create_embedding_non_stream_output(embeddings: List) -> Output:
         blob = _embedding_f32_blob(embeddings, shape[0], shape[1])
     except (TypeError, ValueError):
         return create_non_stream_output(data)
-    response_dict = {
-        "data": data + "\n",
-        "last": True,
-    }
-    response_dict["embedding_f32"] = base64.b64encode(blob).decode("ascii")
-    output = Output()
-    output.add_property("Content-Type", "application/json")
-    output.add(Output.binary_encode(response_dict))
+    output = create_non_stream_output(data)
+    output.add(blob, key="embedding-f32")
     return output
 
 

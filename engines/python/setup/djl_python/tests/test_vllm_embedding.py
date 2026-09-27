@@ -10,7 +10,6 @@
 # or in the "LICENSE.txt" file accompanying this file. This file is distributed on an "AS IS"
 # BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied. See the License for
 # the specific language governing permissions and limitations under the License.
-import base64
 import json
 import struct
 import unittest
@@ -160,9 +159,16 @@ class TestEmbeddingOutputFormatter(unittest.TestCase):
         self.assertIn("error", decoded)
         self.assertEqual(decoded["code"], "500")
         self.assertNotIn("embedding_f32", decoded)
+        self.assertIsNone(self._embedding_f32_bytes(output))
 
-    def _assert_embedding_f32(self, encoded: str, embeddings):
-        blob = base64.b64decode(encoded)
+    def _embedding_f32_bytes(self, output):
+        for i in range(output.content.size()):
+            if output.content.key_at(i) == "embedding-f32":
+                return bytes(output.content.value_at(i))
+        return None
+
+    def _assert_embedding_f32(self, blob: bytes, embeddings):
+        self.assertIsNotNone(blob)
         count = len(embeddings)
         dimension = len(embeddings[0])
         version, blob_count, blob_dimension = struct.unpack_from("<iii", blob, 0)
@@ -193,8 +199,9 @@ class TestEmbeddingOutputFormatter(unittest.TestCase):
         self.assertEqual(json.loads(decoded["data"].strip()), embeddings)
         self.assertEqual(decoded["data"], json.dumps(embeddings) + "\n")
         self.assertEqual(decoded["last"], "True")
+        self.assertNotIn("embedding_f32", decoded)
         self.assertEqual(output.properties.get("Content-Type"), "application/json")
-        self._assert_embedding_f32(decoded["embedding_f32"], embeddings)
+        self._assert_embedding_f32(self._embedding_f32_bytes(output), embeddings)
 
     def test_high_dimensional_embedding_f32_matches_json(self):
         embedding = [float(i) / 1000 for i in range(768)]
@@ -207,7 +214,8 @@ class TestEmbeddingOutputFormatter(unittest.TestCase):
         decoded = _decode_output(output)
         data = json.loads(decoded["data"].strip())
         self.assertEqual(data, [embedding])
-        self._assert_embedding_f32(decoded["embedding_f32"], [embedding])
+        self.assertNotIn("embedding_f32", decoded)
+        self._assert_embedding_f32(self._embedding_f32_bytes(output), [embedding])
 
     def test_error_response_omits_embedding_f32(self):
         mock_response = MagicMock()
@@ -218,6 +226,7 @@ class TestEmbeddingOutputFormatter(unittest.TestCase):
         decoded = _decode_output(output)
         self.assertEqual(decoded["code"], "404")
         self.assertNotIn("embedding_f32", decoded)
+        self.assertIsNone(self._embedding_f32_bytes(output))
 
 
 class TestTaskToRunnerConvertMapping(unittest.TestCase):
@@ -491,6 +500,36 @@ class TestPreprocessRequestEmbedding(unittest.TestCase):
         inp = _make_json_input({"inputs": 42})
         with self.assertRaises(ValueError):
             handler.preprocess_request(inp)
+
+    @patch('djl_python.lmi_vllm.vllm_async_service.decode')
+    @patch('djl_python.lmi_vllm.vllm_async_service._extract_lora_adapter')
+    def test_typed_embed_texts_skip_json_decode(self, mock_extract_lora,
+                                                mock_decode):
+        from djl_python.lmi_vllm.vllm_async_service import VLLMHandler
+        handler = VLLMHandler()
+        handler.is_embedding = True
+        handler.normalize_embeddings = True
+        handler.model_name = "test-embed-model"
+        handler.embedding_service = MagicMock()
+        handler.output_formatter = None
+        handler.session_manager = None
+        mock_extract_lora.return_value = None
+
+        texts = ["alpha", "bêta"]
+        parts = [struct.pack("<ii", 1, len(texts))]
+        for text in texts:
+            raw = text.encode("utf-8")
+            parts.append(struct.pack("<i", len(raw)))
+            parts.append(raw)
+        inp = Input()
+        inp.properties["Content-Type"] = "application/x-embedding-texts"
+        inp.content = PairList()
+        inp.content.add(key="embed-texts", value=bytearray(b"".join(parts)))
+
+        result = handler.preprocess_request(inp)
+
+        mock_decode.assert_not_called()
+        self.assertEqual(result.vllm_request.input, texts)
 
 
 class TestEmbeddingInference(unittest.TestCase):
